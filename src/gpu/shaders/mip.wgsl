@@ -1,5 +1,7 @@
-// Maximum Intensity Projection (MIP) ray marching shader
-// Orthographic projection through a 3D volume stored as a flat storage buffer
+// Volume ray marching shader
+// Supports MIP, MinIP, Average, and Compositing (DVR) modes
+// Hardware-filtered 3D texture, transfer function, Blinn-Phong lighting
+// Ray-AABB intersection, brick-map empty space skipping, adaptive stepping
 
 struct Uniforms {
     // Camera (radians)
@@ -25,6 +27,20 @@ struct Uniforms {
     // Canvas
     canvasWidth: f32,
     canvasHeight: f32,
+    // Rendering
+    frameCount: f32,
+    renderMode: f32,
+    opacityScale: f32,
+    // Lighting
+    ambient: f32,
+    diffuse: f32,
+    specular: f32,
+    shininess: f32,
+    lightingEnabled: f32,
+    // Brick map
+    brickGridX: f32,
+    brickGridY: f32,
+    brickGridZ: f32,
 };
 
 struct VertexOutput {
@@ -33,7 +49,12 @@ struct VertexOutput {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read> volume: array<f32>;
+@group(0) @binding(1) var volumeTex: texture_3d<f32>;
+@group(0) @binding(2) var volumeSampler: sampler;
+@group(0) @binding(3) var tfTexture: texture_2d<f32>;
+@group(0) @binding(4) var tfSampler: sampler;
+@group(0) @binding(5) var brickTex: texture_3d<f32>;
+@group(0) @binding(6) var brickSampler: sampler;
 
 // Fullscreen triangle
 @vertex
@@ -46,70 +67,75 @@ fn vs(@builtin(vertex_index) vi: u32) -> VertexOutput {
     return out;
 }
 
-// Sample volume with trilinear interpolation for smooth rendering
-fn sampleVolume(pos: vec3f) -> f32 {
-    // Clamp to valid range
-    let px = clamp(pos.x, 0.0, u.dimX - 1.001);
-    let py = clamp(pos.y, 0.0, u.dimY - 1.001);
-    let pz = clamp(pos.z, 0.0, u.dimZ - 1.001);
+// Sample volume using hardware-filtered 3D texture
+fn sampleVolume(voxPos: vec3f) -> f32 {
+    let dims = vec3f(u.dimX, u.dimY, u.dimZ);
+    let uvw = (voxPos + 0.5) / dims;
+    return textureSampleLevel(volumeTex, volumeSampler, uvw, 0.0).r;
+}
 
-    // Get integer coordinates of 8 surrounding voxels
-    let x0 = u32(floor(px));
-    let y0 = u32(floor(py));
-    let z0 = u32(floor(pz));
-    let x1 = min(x0 + 1u, u32(u.dimX) - 1u);
-    let y1 = min(y0 + 1u, u32(u.dimY) - 1u);
-    let z1 = min(z0 + 1u, u32(u.dimZ) - 1u);
+// Hash for jittered ray start to eliminate banding
+fn hash(p: vec2f) -> f32 {
+    return fract(sin(dot(p, vec2f(12.9898, 78.233))) * 43758.5453);
+}
 
-    // Fractional parts for interpolation
-    let fx = px - floor(px);
-    let fy = py - floor(py);
-    let fz = pz - floor(pz);
+// Transfer function lookup
+fn lookupTF(intensity: f32) -> vec4f {
+    let range = u.displayMax - u.displayMin;
+    let t = clamp((intensity - u.displayMin) / max(range, 0.001), 0.0, 1.0);
+    return textureSampleLevel(tfTexture, tfSampler, vec2f(t, 0.5), 0.0);
+}
 
-    // Sample 8 corners of the cube
-    let nx = u32(u.dimX);
-    let nxy = u32(u.dimX) * u32(u.dimY);
+// Central-difference gradient (6 texture samples)
+fn computeGradient(voxPos: vec3f) -> vec3f {
+    return vec3f(
+        sampleVolume(voxPos + vec3f(1.0, 0.0, 0.0)) - sampleVolume(voxPos - vec3f(1.0, 0.0, 0.0)),
+        sampleVolume(voxPos + vec3f(0.0, 1.0, 0.0)) - sampleVolume(voxPos - vec3f(0.0, 1.0, 0.0)),
+        sampleVolume(voxPos + vec3f(0.0, 0.0, 1.0)) - sampleVolume(voxPos - vec3f(0.0, 0.0, 1.0))
+    ) * 0.5;
+}
 
-    let v000 = volume[x0 + y0 * nx + z0 * nxy];
-    let v100 = volume[x1 + y0 * nx + z0 * nxy];
-    let v010 = volume[x0 + y1 * nx + z0 * nxy];
-    let v110 = volume[x1 + y1 * nx + z0 * nxy];
-    let v001 = volume[x0 + y0 * nx + z1 * nxy];
-    let v101 = volume[x1 + y0 * nx + z1 * nxy];
-    let v011 = volume[x0 + y1 * nx + z1 * nxy];
-    let v111 = volume[x1 + y1 * nx + z1 * nxy];
-
-    // Trilinear interpolation
-    let v00 = mix(v000, v100, fx);
-    let v01 = mix(v001, v101, fx);
-    let v10 = mix(v010, v110, fx);
-    let v11 = mix(v011, v111, fx);
-
-    let v0 = mix(v00, v10, fy);
-    let v1 = mix(v01, v11, fy);
-
-    return mix(v0, v1, fz);
+// Blinn-Phong shading with headlight (light = camera view direction)
+fn blinnPhong(normal: vec3f, viewDir: vec3f, baseColor: vec3f) -> vec3f {
+    let n = normalize(normal);
+    let h = normalize(viewDir + viewDir); // headlight: L = V
+    let diff = u.diffuse * max(dot(n, viewDir), 0.0);
+    let spec = u.specular * pow(max(dot(n, h), 0.0), u.shininess);
+    return u.ambient * baseColor + diff * baseColor + spec * vec3f(1.0);
 }
 
 // Build turntable camera matrix with Z-up
-// az: rotation around world Z axis (turntable spin)
-// el: elevation angle above XY plane (0 = side, pi/2 = top-down)
-// ro: roll around view direction
 fn rotationMatrix(az: f32, el: f32, ro: f32) -> mat3x3f {
     let sa = sin(az); let ca = cos(az);
     let se = sin(el); let ce = cos(el);
     let sr = sin(ro); let cr = cos(ro);
 
-    // Turntable base vectors (Z-up, looking toward center)
     let right0 = vec3f(-sa, ca, 0.0);
     let up0 = vec3f(-ca * se, -sa * se, ce);
     let fwd0 = vec3f(-ce * ca, -ce * sa, -se);
 
-    // Apply roll around view direction
     let right = right0 * cr + up0 * sr;
     let up = -right0 * sr + up0 * cr;
 
     return mat3x3f(right, up, fwd0);
+}
+
+// Ray-AABB intersection: returns (tNear, tFar)
+fn intersectAABB(origin: vec3f, dir: vec3f, boxMin: vec3f, boxMax: vec3f) -> vec2f {
+    let invDir = 1.0 / dir;
+    let t1 = (boxMin - origin) * invDir;
+    let t2 = (boxMax - origin) * invDir;
+    let tMin = min(t1, t2);
+    let tMax = max(t1, t2);
+    let tNear = max(tMin.x, max(tMin.y, tMin.z));
+    let tFar  = min(tMax.x, min(tMax.y, tMax.z));
+    return vec2f(max(tNear, 0.0), tFar);
+}
+
+// Brick map lookup: returns (min, max) intensity for the 8³ brick containing voxPos
+fn lookupBrick(voxPos: vec3f) -> vec2f {
+    let brickUVW = (floor(voxPos / 8.0) + 0.5) / vec3f(u.brickGridX, u.brickGridY, u.brickGridZ);
+    return textureSampleLevel(brickTex, brickSampler, brickUVW, 0.0).rg;
 }
 
 @fragment
@@ -139,46 +165,135 @@ fn fs(in: VertexOutput) -> @location(0) vec4f {
     let rayRight = rot[0];
     let rayUp = rot[1];
 
-    // Starting point: far behind the volume center, offset by screen position
+    // Starting point: offset by screen position, far behind volume center
     let rayOrigin = screenPos.x * rayRight + screenPos.y * rayUp - 1.5 * rayDir;
 
+    // Ray-AABB intersection to clip march to volume bounds
+    let boxMin = -normSize * 0.5;
+    let boxMax =  normSize * 0.5;
+    let tRange = intersectAABB(rayOrigin, rayDir, boxMin, boxMax);
+
+    if (tRange.x >= tRange.y) {
+        return vec4f(0.0, 0.0, 0.0, 1.0);
+    }
+
     // Convert ray to voxel space
-    // Normalized space [-0.5, 0.5] → voxel space [0, dim]
     let toVoxel = dims / normSize;
     let center = dims * 0.5;
 
     let numSteps = u32(u.numSteps);
-    // Step through 3 units of diagonal (enough to traverse the volume)
-    let totalDist = 3.0;
-    let stepSize = totalDist / f32(numSteps);
+    let baseStep = (tRange.y - tRange.x) / f32(numSteps);
 
+    // Brick size in normalized space (one brick = 8 voxels along largest axis)
+    let brickNormSize = 8.0 / max(toVoxel.x, max(toVoxel.y, toVoxel.z));
+
+    // Jittered ray start to eliminate banding
+    let jitter = hash(in.position.xy + vec2f(u.frameCount * 0.7919, 0.0));
+    let tStart = tRange.x + jitter * baseStep;
+
+    let mode = u32(u.renderMode);
+
+    // Mode-specific accumulators
     var maxVal: f32 = -1e20;
+    var minVal: f32 = 1e20;
+    var sumVal: f32 = 0.0;
+    var sampleCount: f32 = 0.0;
+    var accumColor = vec4f(0.0, 0.0, 0.0, 0.0);
     var hitVolume = false;
 
+    var t = tStart;
+
     for (var i = 0u; i < numSteps; i++) {
-        let t = f32(i) * stepSize;
+        if (t > tRange.y) { break; }
+
         let pos = rayOrigin + rayDir * t;
 
         // Convert normalized position to voxel coordinates
         let voxPos = pos * toVoxel + center;
 
-        // Check bounds
-        if (voxPos.x >= 0.0 && voxPos.x < dims.x &&
-            voxPos.y >= 0.0 && voxPos.y < dims.y &&
-            voxPos.z >= 0.0 && voxPos.z < dims.z) {
-            let val = sampleVolume(voxPos);
-            maxVal = max(maxVal, val);
-            hitVolume = true;
+        // Brick map skip: check if brick is empty
+        let brick = lookupBrick(voxPos);
+        if (brick.y < u.displayMin) {
+            // Empty brick — skip ahead by one brick width
+            t += brickNormSize;
+            continue;
         }
+
+        let val = sampleVolume(voxPos);
+        hitVolume = true;
+
+        // Adaptive step: fine near surfaces (high brick range), coarse in uniform
+        let brickRange = brick.y - brick.x;
+        let volRange = u.displayMax - u.displayMin;
+        let surfaceRatio = clamp(brickRange / max(volRange * 0.1, 0.001), 0.0, 1.0);
+        let adaptiveStep = mix(baseStep * 2.0, baseStep * 0.5, surfaceRatio);
+
+        switch mode {
+            case 0u: { // MIP
+                maxVal = max(maxVal, val);
+            }
+            case 1u: { // MinIP
+                minVal = min(minVal, val);
+            }
+            case 2u: { // Average
+                sumVal += val;
+                sampleCount += 1.0;
+            }
+            case 3u: { // Compositing (front-to-back)
+                let tf = lookupTF(val);
+                // Scale alpha by adaptiveStep/baseStep to compensate for variable step size
+                let alpha = tf.a * u.opacityScale * adaptiveStep * 100.0;
+                var color = tf.rgb;
+
+                // Apply lighting if enabled and sample is visible
+                if (u.lightingEnabled > 0.5 && alpha > 0.001) {
+                    let grad = computeGradient(voxPos);
+                    let spacingInv = vec3f(1.0 / u.spacingX, 1.0 / u.spacingY, 1.0 / u.spacingZ);
+                    let worldGrad = grad * spacingInv;
+                    if (length(worldGrad) > 0.01) {
+                        color = blinnPhong(worldGrad, -rayDir, color);
+                    }
+                }
+
+                let src = vec4f(color * alpha, alpha);
+                accumColor += src * (1.0 - accumColor.a);
+
+                // Early ray termination
+                if (accumColor.a >= 0.95) {
+                    break;
+                }
+            }
+            default: {
+                maxVal = max(maxVal, val);
+            }
+        }
+
+        t += adaptiveStep;
     }
 
     if (!hitVolume) {
         return vec4f(0.0, 0.0, 0.0, 1.0);
     }
 
+    // Mode 3 (Compositing): output accumulated color directly
+    if (mode == 3u) {
+        return vec4f(accumColor.rgb, 1.0);
+    }
+
+    // For projection modes, determine the result value
+    var resultVal: f32;
+    switch mode {
+        case 0u: { resultVal = maxVal; }
+        case 1u: { resultVal = minVal; }
+        case 2u: {
+            resultVal = select(0.0, sumVal / sampleCount, sampleCount > 0.0);
+        }
+        default: { resultVal = maxVal; }
+    }
+
     // Window/level mapping
     let range = u.displayMax - u.displayMin;
-    let normalized = clamp((maxVal - u.displayMin) / max(range, 0.001), 0.0, 1.0);
+    let normalized = clamp((resultVal - u.displayMin) / max(range, 0.001), 0.0, 1.0);
 
     // Gamma correction
     let corrected = pow(normalized, u.gamma);

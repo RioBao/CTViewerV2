@@ -1,6 +1,6 @@
 import { WebGPUContext } from '../gpu/WebGPUContext.js';
 import { SliceRenderer } from '../gpu/SliceRenderer.js';
-import { MIPRenderer } from '../gpu/MIPRenderer.js';
+import { MIPRenderer, TF_PRESETS, RENDER_MODE } from '../gpu/MIPRenderer.js';
 import { UIState } from './UIState.js';
 import { FilePicker, type FileGroup } from './FilePicker.js';
 import { loadVolume } from '../loaders/VolumeLoader.js';
@@ -53,6 +53,15 @@ export class ViewerApp {
 
     // Active 2D view for keyboard slice navigation
     private activeAxis: ViewAxis = 'xy';
+
+    // 2D drag state
+    private slice2DDragging = false;
+    private slice2DDidMove = false;
+    private slice2DLastX = 0;
+    private slice2DLastY = 0;
+    private slice2DStartX = 0;
+    private slice2DStartY = 0;
+    private slice2DDragAxis: ViewAxis | null = null;
 
     // Render scheduling
     private renderPending = false;
@@ -240,18 +249,19 @@ export class ViewerApp {
 
         // Upload volume to 3D renderer
         // Streaming volumes: upload the 4x downsampled MIP volume (→ "low")
-        // Standard volumes: upload full if it fits GPU buffer, else downsample
+        // Standard volumes: upload full if dimensions fit 3D texture limit, else downsample
         const mipVolume = volume.getMIPVolume();
-        const maxBufSize = this.gpu?.device.limits.maxStorageBufferBindingSize ?? 0;
-        const mipF32Bytes = mipVolume.data.length * 4; // Float32 size on GPU
+        const maxDim3D = this.gpu?.device.limits.maxTextureDimension3D ?? 0;
+        const [mnx, mny, mnz] = mipVolume.dimensions;
+        const dimsFit = mnx <= maxDim3D && mny <= maxDim3D && mnz <= maxDim3D;
         if (this.mipRenderer) {
-            if (mipF32Bytes <= maxBufSize) {
+            if (dimsFit) {
                 this.mipRenderer.uploadVolume(mipVolume);
                 this.current3DResolution = volume.isStreaming ? 'low' : 'full';
                 this.update3DResolutionIndicator(mipVolume);
             } else {
-                // Full data too large for GPU — generate 4x downsample async
-                console.warn(`MIP volume (${(mipF32Bytes / 1e9).toFixed(1)}GB) exceeds GPU buffer limit (${(maxBufSize / 1e9).toFixed(1)}GB), downsampling`);
+                // Full data too large for 3D texture — generate 4x downsample async
+                console.warn(`MIP volume (${mnx}×${mny}×${mnz}) exceeds 3D texture limit (${maxDim3D}), downsampling`);
                 this.current3DResolution = 'low';
                 const status = document.getElementById('resolution3DStatus');
                 if (mipVolume.canEnhance3D()) {
@@ -312,7 +322,7 @@ export class ViewerApp {
         if (!lowOption || !midOption || !fullOption) return;
 
         const [nx, ny, nz] = volume.dimensions;
-        const maxBufSize = this.gpu?.device.limits.maxStorageBufferBindingSize ?? 0;
+        const maxDim3D = this.gpu?.device.limits.maxTextureDimension3D ?? 0;
 
         // Low (4x downsample)
         const lowNx = Math.ceil(nx / 4);
@@ -325,15 +335,12 @@ export class ViewerApp {
         const midNx = Math.ceil(nx / 2);
         const midNy = Math.ceil(ny / 2);
         const midNz = Math.ceil(nz / 2);
-        const midVoxels = midNx * midNy * midNz;
-        const midBytes = midVoxels * 4; // Float32
-        const canMid = volume.canEnhance3D() && midBytes <= maxBufSize;
+        const canMid = volume.canEnhance3D() && midNx <= maxDim3D && midNy <= maxDim3D && midNz <= maxDim3D;
         midOption.textContent = `Mid (${midNx}×${midNy}×${midNz})`;
         midOption.disabled = !canMid;
 
         // Full
-        const fullBytes = nx * ny * nz * 4; // Float32
-        const canFull = !volume.isStreaming && fullBytes <= maxBufSize;
+        const canFull = !volume.isStreaming && nx <= maxDim3D && ny <= maxDim3D && nz <= maxDim3D;
         fullOption.textContent = `Full (${nx}×${ny}×${nz})`;
         fullOption.disabled = !canFull;
 
@@ -613,13 +620,6 @@ export class ViewerApp {
             const canvas = this.sliceCanvases[axis];
             if (!canvas) continue;
 
-            let dragging = false;
-            let didMove = false;
-            let lastX = 0;
-            let lastY = 0;
-            let startX = 0;
-            let startY = 0;
-
             // Track active view
             canvas.addEventListener('mousedown', (e) => {
                 this.activeAxis = axis;
@@ -636,77 +636,14 @@ export class ViewerApp {
                     return;
                 }
 
-                dragging = true;
-                didMove = false;
-                lastX = e.clientX;
-                lastY = e.clientY;
-                startX = e.clientX;
-                startY = e.clientY;
+                this.slice2DDragging = true;
+                this.slice2DDidMove = false;
+                this.slice2DLastX = e.clientX;
+                this.slice2DLastY = e.clientY;
+                this.slice2DStartX = e.clientX;
+                this.slice2DStartY = e.clientY;
+                this.slice2DDragAxis = axis;
             });
-
-            // Global move/up for drag handling
-            const onMouseMove = (e: MouseEvent) => {
-                // ROI drag
-                if (this.roiDragging && this.roiAxis === axis) {
-                    const containerRect = this.viewportContainers[axis].getBoundingClientRect();
-                    this.roiEndCSS = { x: e.clientX - containerRect.left, y: e.clientY - containerRect.top };
-                    this.updateRoiOverlay();
-                    return;
-                }
-
-                if (!dragging || !this.volume) return;
-
-                const dx = e.clientX - lastX;
-                const dy = e.clientY - lastY;
-                lastX = e.clientX;
-                lastY = e.clientY;
-
-                // Check if we've moved enough to count as a drag
-                if (Math.abs(e.clientX - startX) > 3 || Math.abs(e.clientY - startY) > 3) {
-                    didMove = true;
-                }
-
-                if (didMove) {
-                    // Pan: convert CSS px delta to slice px delta for each renderer
-                    for (const a of AXES) {
-                        const r = this.sliceRenderers[a];
-                        if (!r) continue;
-                        const c = this.sliceCanvases[a]!;
-                        const scale = c.width / c.clientWidth;
-                        const [sdx, sdy] = r.canvasDeltaToSlice(dx * scale, dy * scale);
-                        r.panX += sdx;
-                        r.panY += sdy;
-                    }
-                    this.uiState.update({ panX: dx, panY: dy }); // just to trigger statechange
-                    this.scheduleSliceRender();
-                }
-            };
-
-            const onMouseUp = (e: MouseEvent) => {
-                // ROI release
-                if (this.roiDragging && this.roiAxis === axis) {
-                    this.roiDragging = false;
-                    this.applyRoiSelection(axis);
-                    this.removeRoiOverlay();
-                    this.setRoiMode(false);
-                    return;
-                }
-
-                if (!dragging) return;
-                dragging = false;
-
-                // Click without drag: set crosshair
-                if (!didMove && this.crosshairsEnabled && this.volume) {
-                    const rect = canvas.getBoundingClientRect();
-                    const dpr = canvas.width / canvas.clientWidth;
-                    const cx = (e.clientX - rect.left) * dpr;
-                    const cy = (e.clientY - rect.top) * dpr;
-                    this.setCrosshairFromClick(axis, cx, cy);
-                }
-            };
-
-            window.addEventListener('mousemove', onMouseMove);
-            window.addEventListener('mouseup', onMouseUp);
 
             // Wheel: Ctrl=zoom, plain=slice scroll
             canvas.addEventListener('wheel', (e) => {
@@ -737,6 +674,84 @@ export class ViewerApp {
                 this.toggleMaximize(axis);
             });
         }
+
+        // Global mouse handlers (single set for all canvases)
+        window.addEventListener('mousemove', (e) => {
+            // ROI drag
+            if (this.roiDragging && this.roiAxis) {
+                const containerRect = this.viewportContainers[this.roiAxis].getBoundingClientRect();
+                this.roiEndCSS = { x: e.clientX - containerRect.left, y: e.clientY - containerRect.top };
+                this.updateRoiOverlay();
+                return;
+            }
+
+            if (!this.slice2DDragging || !this.volume) return;
+
+            const dx = e.clientX - this.slice2DLastX;
+            const dy = e.clientY - this.slice2DLastY;
+            this.slice2DLastX = e.clientX;
+            this.slice2DLastY = e.clientY;
+
+            // Check if we've moved enough to count as a drag
+            if (Math.abs(e.clientX - this.slice2DStartX) > 3 || Math.abs(e.clientY - this.slice2DStartY) > 3) {
+                this.slice2DDidMove = true;
+            }
+
+            if (this.slice2DDidMove) {
+                if (this.crosshairsEnabled && this.slice2DDragAxis) {
+                    // Crosshair drag: continuously update crosshair position
+                    const canvas = this.sliceCanvases[this.slice2DDragAxis];
+                    if (canvas) {
+                        const rect = canvas.getBoundingClientRect();
+                        const dpr = canvas.width / canvas.clientWidth;
+                        const cx = (e.clientX - rect.left) * dpr;
+                        const cy = (e.clientY - rect.top) * dpr;
+                        this.setCrosshairFromClick(this.slice2DDragAxis, cx, cy);
+                    }
+                } else {
+                    // Pan: convert CSS px delta to slice px delta for each renderer
+                    for (const a of AXES) {
+                        const r = this.sliceRenderers[a];
+                        if (!r) continue;
+                        const c = this.sliceCanvases[a]!;
+                        const scale = c.width / c.clientWidth;
+                        const [sdx, sdy] = r.canvasDeltaToSlice(dx * scale, dy * scale);
+                        r.panX += sdx;
+                        r.panY += sdy;
+                    }
+                    this.uiState.update({ panX: dx, panY: dy }); // just to trigger statechange
+                    this.scheduleSliceRender();
+                }
+            }
+        });
+
+        window.addEventListener('mouseup', (e) => {
+            // ROI release
+            if (this.roiDragging && this.roiAxis) {
+                this.roiDragging = false;
+                this.applyRoiSelection(this.roiAxis);
+                this.removeRoiOverlay();
+                this.setRoiMode(false);
+                return;
+            }
+
+            if (!this.slice2DDragging) return;
+            this.slice2DDragging = false;
+
+            // Click without drag: set crosshair
+            if (!this.slice2DDidMove && this.crosshairsEnabled && this.volume && this.slice2DDragAxis) {
+                const canvas = this.sliceCanvases[this.slice2DDragAxis];
+                if (canvas) {
+                    const rect = canvas.getBoundingClientRect();
+                    const dpr = canvas.width / canvas.clientWidth;
+                    const cx = (e.clientX - rect.left) * dpr;
+                    const cy = (e.clientY - rect.top) * dpr;
+                    this.setCrosshairFromClick(this.slice2DDragAxis, cx, cy);
+                }
+            }
+
+            this.slice2DDragAxis = null;
+        });
     }
 
     // ================================================================
@@ -1184,9 +1199,8 @@ export class ViewerApp {
 
             // Left-right: spin turntable around Z-axis (azimuth)
             this.mipRenderer.azimuth += dx * 0.5 * DEG;
-            // Up-down: tilt elevation
-            this.mipRenderer.elevation = Math.max(-89 * DEG, Math.min(89 * DEG,
-                this.mipRenderer.elevation - dy * 0.5 * DEG));
+            // Up-down: continuous elevation rotation (no clamp)
+            this.mipRenderer.elevation -= dy * 0.5 * DEG;
 
             this.mipRenderer.render();
         });
@@ -1248,6 +1262,57 @@ export class ViewerApp {
                     this.mipRenderer.render();
                 }
                 if (gammaValue) gammaValue.textContent = val.toFixed(1);
+            });
+        }
+
+        // Render mode select
+        const renderModeSelect = document.getElementById('renderModeSelect') as HTMLSelectElement | null;
+        const tfPresetGroup = document.getElementById('tfPresetGroup');
+        const lightingGroup = document.getElementById('lightingGroup');
+        const tfPresetSelect = document.getElementById('tfPresetSelect') as HTMLSelectElement | null;
+
+        // Populate TF preset dropdown
+        if (tfPresetSelect) {
+            for (const preset of TF_PRESETS) {
+                const opt = document.createElement('option');
+                opt.value = preset.name;
+                opt.textContent = preset.name;
+                tfPresetSelect.appendChild(opt);
+            }
+            tfPresetSelect.addEventListener('change', () => {
+                const preset = TF_PRESETS.find(p => p.name === tfPresetSelect.value);
+                if (preset && this.mipRenderer) {
+                    this.mipRenderer.setTransferFunction(preset);
+                    this.mipRenderer.render();
+                }
+            });
+        }
+
+        if (renderModeSelect) {
+            renderModeSelect.addEventListener('change', () => {
+                const mode = parseInt(renderModeSelect.value, 10);
+                if (this.mipRenderer) {
+                    this.mipRenderer.setRenderMode(mode);
+                    this.mipRenderer.render();
+                }
+                const isCompositing = mode === RENDER_MODE.Compositing;
+                if (tfPresetGroup) tfPresetGroup.style.display = isCompositing ? '' : 'none';
+                if (lightingGroup) lightingGroup.style.display = isCompositing ? '' : 'none';
+                // Sync lighting state when switching to compositing
+                if (isCompositing && this.mipRenderer && lightingToggle) {
+                    this.mipRenderer.setLightingEnabled(lightingToggle.checked);
+                }
+            });
+        }
+
+        // Lighting toggle
+        const lightingToggle = document.getElementById('lightingToggle') as HTMLInputElement | null;
+        if (lightingToggle) {
+            lightingToggle.addEventListener('change', () => {
+                if (this.mipRenderer) {
+                    this.mipRenderer.setLightingEnabled(lightingToggle.checked);
+                    this.mipRenderer.render();
+                }
             });
         }
 
@@ -1426,6 +1491,8 @@ export class ViewerApp {
                 this.mipRenderer.resetCamera();
                 this.mipRenderer.setWindow(this.volume.min, this.volume.max);
                 this.mipRenderer.gamma = 1.0;
+                this.mipRenderer.setRenderMode(RENDER_MODE.MIP);
+                this.mipRenderer.setLightingEnabled(true);
             }
 
             // Reset gamma slider
@@ -1433,6 +1500,16 @@ export class ViewerApp {
             const gammaValue = document.getElementById('gamma3DValue');
             if (gammaSlider) gammaSlider.value = '1';
             if (gammaValue) gammaValue.textContent = '1.0';
+
+            // Reset render mode dropdown
+            const renderModeSelect = document.getElementById('renderModeSelect') as HTMLSelectElement | null;
+            if (renderModeSelect) renderModeSelect.value = '0';
+            const tfPresetGroup = document.getElementById('tfPresetGroup');
+            const lightingGroup = document.getElementById('lightingGroup');
+            const lightingToggle = document.getElementById('lightingToggle') as HTMLInputElement | null;
+            if (tfPresetGroup) tfPresetGroup.style.display = 'none';
+            if (lightingGroup) lightingGroup.style.display = 'none';
+            if (lightingToggle) lightingToggle.checked = true;
 
             // Reset histogram
             this.drawHistogram();
