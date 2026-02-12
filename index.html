@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CTViewer WebGPU</title>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>CTViewer WebGPU</h1>
+            <div class="controls">
+                <button id="openBtn" title="Open Images (O)">Open</button>
+                <button id="resetBtn" title="Reset View (R)">Reset</button>
+                <button id="fullscreenBtn" title="Fullscreen (F)">Fullscreen</button>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <div class="viewer-container" id="dropZone">
+                <div class="image-wrapper" id="imageWrapper">
+                    <div class="placeholder" id="placeholder">
+                        <p>Drop images here or click "Open" to select files</p>
+                        <p class="hint">Supports 2D: JPG, PNG, TIFF | 3D: RAW+metadata (.json/.volumeinfo/.dat), DICOM series, NIfTI</p>
+                    </div>
+
+                    <div id="ct3DView" class="ct-view" style="display: none;">
+                        <div class="viewport-container">
+                            <span class="viewport-label">XY (Axial)</span>
+                            <span class="lowres-indicator" id="lowresXY">LOW-RES</span>
+                            <canvas id="canvasXY" class="viewport-canvas"></canvas>
+                        </div>
+                        <div class="viewport-container">
+                            <span class="viewport-label">XZ (Coronal)</span>
+                            <span class="lowres-indicator" id="lowresXZ">LOW-RES</span>
+                            <canvas id="canvasXZ" class="viewport-canvas"></canvas>
+                        </div>
+                        <div class="viewport-container">
+                            <span class="viewport-label">YZ (Sagittal)</span>
+                            <span class="lowres-indicator" id="lowresYZ">LOW-RES</span>
+                            <canvas id="canvasYZ" class="viewport-canvas"></canvas>
+                        </div>
+                        <div class="viewport-container viewport-3d">
+                            <span class="viewport-label">3D</span>
+                            <span class="resolution-indicator" id="resolution3D"></span>
+                            <canvas id="canvas3D" class="viewport-canvas"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="sidebar" id="ctControls">
+                <div class="sidebar-section" id="histogramGroup">
+                    <h4>Histogram</h4>
+                    <div class="histogram-container">
+                        <canvas id="histogramCanvas"></canvas>
+                        <div class="histogram-handles">
+                            <div class="handle handle-min" id="handleMin"></div>
+                            <div class="handle handle-max" id="handleMax"></div>
+                        </div>
+                    </div>
+                    <div class="histogram-values">
+                        <span id="histogramMin">0</span>
+                        <span id="histogramMax">255</span>
+                    </div>
+                </div>
+
+                <div class="sidebar-section" id="toolControls">
+                    <h4>Tools</h4>
+                    <div class="tool-buttons">
+                        <button id="zoomInBtn" title="Zoom In (+)" class="tool-button">Zoom +</button>
+                        <button id="zoomOutBtn" title="Zoom Out (-)" class="tool-button">Zoom -</button>
+                        <button id="roiBtn" title="Set range from region (Esc to cancel)" disabled class="tool-button">ROI</button>
+                        <button id="crosshairBtn" title="Toggle crosshairs (C)" disabled class="tool-button">Crosshair</button>
+                    </div>
+                </div>
+
+                <div class="sidebar-section" id="sliceControls">
+                    <h4>Slices</h4>
+                    <div class="slice-indicators">
+                        <span id="sliceIndicatorXY" class="slice-indicator">XY: 0/0</span>
+                        <span id="sliceIndicatorXZ" class="slice-indicator">XZ: 0/0</span>
+                        <span id="sliceIndicatorYZ" class="slice-indicator">YZ: 0/0</span>
+                    </div>
+                </div>
+
+                <div class="sidebar-section" id="pixelInfoGroup" style="display: none;">
+                    <h4>Pixel Value</h4>
+                    <span id="pixelInfo" class="slice-indicator">X: 0, Y: 0, Z: 0 = 0</span>
+                </div>
+
+                <div class="sidebar-section" id="quality3DGroup">
+                    <h4>3D Rendering</h4>
+                    <div class="control-row">
+                        <label for="resolution3DSelect">Resolution</label>
+                        <select id="resolution3DSelect">
+                            <option value="low" selected>Low</option>
+                            <option value="mid">Mid</option>
+                            <option value="full">Full</option>
+                        </select>
+                        <span id="resolution3DStatus" style="margin-left: 8px; font-size: 0.9em; color: var(--text-secondary);"></span>
+                    </div>
+                    <div class="control-row">
+                        <label for="quality3DSelect">Quality</label>
+                        <select id="quality3DSelect">
+                            <option value="low" selected>Low (Fast)</option>
+                            <option value="medium">Medium</option>
+                            <option value="high">High (Slow)</option>
+                        </select>
+                    </div>
+                    <div class="control-row">
+                        <label for="gamma3DSlider">Gamma <span id="gamma3DValue">1.0</span></label>
+                        <input type="range" id="gamma3DSlider" min="0.1" max="4" step="0.1" value="1">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="info-bar">
+            <span id="fileName">No file loaded</span>
+            <span id="imageInfo"></span>
+            <span id="zoomLevel">100%</span>
+        </div>
+    </div>
+
+    <div id="webgpu-error" class="webgpu-error" style="display: none;">
+        <h2>WebGPU Not Available</h2>
+        <p>Your browser does not support WebGPU, which is required for this application.</p>
+        <p>Please use a recent version of Chrome, Edge, or Firefox with WebGPU enabled.</p>
+    </div>
+
+    <input type="file" id="fileInput" multiple accept="image/*,.raw,.json,.volumeinfo,.dat,.tif,.tiff,.dcm,.nii,.nii.gz" style="display: none;">
+
+    <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
