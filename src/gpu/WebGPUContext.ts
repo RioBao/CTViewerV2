@@ -6,11 +6,13 @@ export class WebGPUContext {
     readonly device: GPUDevice;
     readonly preferredFormat: GPUTextureFormat;
     private _lost = false;
+    private _supportsFloat32Filtering: boolean;
 
-    private constructor(adapter: GPUAdapter, device: GPUDevice, preferredFormat: GPUTextureFormat) {
+    private constructor(adapter: GPUAdapter, device: GPUDevice, preferredFormat: GPUTextureFormat, supportsFloat32Filtering: boolean) {
         this.adapter = adapter;
         this.device = device;
         this.preferredFormat = preferredFormat;
+        this._supportsFloat32Filtering = supportsFloat32Filtering;
 
         this.device.lost.then((info) => {
             console.error(`WebGPU device lost: ${info.message} (reason: ${info.reason})`);
@@ -21,6 +23,11 @@ export class WebGPUContext {
     /** Whether the GPU device has been lost */
     get isLost(): boolean {
         return this._lost;
+    }
+
+    /** Whether the device supports hardware filtering of r32float textures */
+    get supportsFloat32Filtering(): boolean {
+        return this._supportsFloat32Filtering;
     }
 
     /**
@@ -38,7 +45,14 @@ export class WebGPUContext {
             throw new Error('Failed to obtain a WebGPU adapter. Your GPU may not be supported.');
         }
 
+        const wantFeatures: GPUFeatureName[] = [];
+        const hasFloat32Filtering = adapter.features.has('float32-filterable');
+        if (hasFloat32Filtering) {
+            wantFeatures.push('float32-filterable');
+        }
+
         const device = await adapter.requestDevice({
+            requiredFeatures: wantFeatures,
             requiredLimits: {
                 maxBufferSize: adapter.limits.maxBufferSize,
                 maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
@@ -46,7 +60,7 @@ export class WebGPUContext {
         });
         const preferredFormat = navigator.gpu.getPreferredCanvasFormat();
 
-        return new WebGPUContext(adapter, device, preferredFormat);
+        return new WebGPUContext(adapter, device, preferredFormat, hasFloat32Filtering);
     }
 
     /**

@@ -202,7 +202,7 @@ button.active:hover {
 
 .slice-indicators {
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
     gap: 0.25rem;
 }
 
