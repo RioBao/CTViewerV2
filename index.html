@@ -7,126 +7,343 @@
 </head>
 <body>
     <div class="container">
-        <header>
-            <h1>CTViewer WebGPU</h1>
-            <div class="controls">
-                <button id="openBtn" title="Open Images (O)">Open</button>
-                <button id="resetBtn" title="Reset View (R)">Reset</button>
-                <button id="fullscreenBtn" title="Fullscreen (F)">Fullscreen</button>
-            </div>
-        </header>
-
         <div class="main-content">
             <div class="viewer-container" id="dropZone">
+                <div class="top-overlay" id="topOverlay">
+                    <div class="top-chip top-actions">
+                        <button id="openBtn" class="icon-btn" title="Open Images (O)" aria-label="Open Images">
+                            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M3 8a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
+                                <path d="M3 11h18"></path>
+                            </svg>
+                        </button>
+                        <button id="resetBtn" class="icon-btn" title="Reset View (R)" aria-label="Reset View">
+                            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M3 12a9 9 0 1 0 3-6.7"></path>
+                                <path d="M3 4v5h5"></path>
+                            </svg>
+                        </button>
+                        <button id="rotateBtn" class="icon-btn" title="Rotate all views 90deg (T)" aria-label="Rotate all views 90 degrees">
+                            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M4 12a8 8 0 1 0 8-8"></path>
+                                <path d="M4 4v6h6"></path>
+                            </svg>
+                        </button>
+                        <button id="fullscreenBtn" class="icon-btn" title="Fullscreen (F)" aria-label="Toggle Fullscreen">
+                            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M8 3H3v5"></path>
+                                <path d="M16 3h5v5"></path>
+                                <path d="M21 16v5h-5"></path>
+                                <path d="M8 21H3v-5"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="tool-dock" id="toolDock">
+                    <button id="dockLogoBtn" class="dock-logo-wrap dock-logo-btn" title="CTViewer WebGPU" aria-label="CTViewer WebGPU">
+                        <span class="dock-logo">V2</span>
+                    </button>
+                    <div class="dock-grip" id="toolDockGrip" title="Drag tool dock">::</div>
+                    <button id="zoomInBtn" class="dock-btn" title="Zoom In (+)" aria-label="Zoom In">
+                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                            <circle cx="11" cy="11" r="6"></circle>
+                            <path d="M21 21l-4.3-4.3"></path>
+                            <path d="M11 8v6"></path>
+                            <path d="M8 11h6"></path>
+                        </svg>
+                    </button>
+                    <button id="zoomOutBtn" class="dock-btn" title="Zoom Out (-)" aria-label="Zoom Out">
+                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                            <circle cx="11" cy="11" r="6"></circle>
+                            <path d="M21 21l-4.3-4.3"></path>
+                            <path d="M8 11h6"></path>
+                        </svg>
+                    </button>
+                    <button id="crosshairBtn" class="dock-btn" title="Toggle crosshairs (C)" aria-label="Toggle Crosshairs" disabled>
+                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                            <circle cx="12" cy="12" r="3"></circle>
+                            <path d="M12 2v4"></path>
+                            <path d="M12 18v4"></path>
+                            <path d="M2 12h4"></path>
+                            <path d="M18 12h4"></path>
+                        </svg>
+                    </button>
+                    <button id="histogramToggleBtn" class="dock-btn" title="Toggle histogram (H)" aria-label="Toggle Histogram">
+                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M4 19v-9"></path>
+                            <path d="M10 19V5"></path>
+                            <path d="M16 19v-7"></path>
+                            <path d="M22 19V8"></path>
+                        </svg>
+                    </button>
+                    <button id="segModeBtn" class="dock-btn" title="Toggle segmentation mode (S)" aria-label="Toggle segmentation mode" disabled>
+                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M4 20l4-1 10-10-3-3L5 16z"></path>
+                            <path d="M13 5l3 3"></path>
+                            <path d="M3 21h5"></path>
+                        </svg>
+                    </button>
+                    <button id="roiBtn" class="dock-btn" title="Adjust contrast" aria-label="Adjust contrast" disabled>
+                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M7 7h10v10H7z"></path>
+                            <path d="M3 9V5h4"></path>
+                            <path d="M21 9V5h-4"></path>
+                            <path d="M3 15v4h4"></path>
+                            <path d="M21 15v4h-4"></path>
+                        </svg>
+                    </button>
+
+                    <div class="tool-mode-panel" id="toolModePanel" aria-hidden="true">
+                        <div class="tool-mode-view" id="toolModeViewing">
+                            <div class="tool-mode-title">Viewing</div>
+                            <div class="tool-mode-hint">Navigate with pan, zoom, histogram, and crosshair.</div>
+                        </div>
+                        <div class="tool-mode-view" id="toolModeMeasuring">
+                            <div class="tool-mode-title">Measuring</div>
+                            <div class="tool-mode-hint">Drag on a slice to create a rectangular measurement ROI.</div>
+                        </div>
+                        <div class="tool-mode-view" id="toolModeSegmentation">
+                            <div class="tool-mode-title">Segmentation Tools</div>
+                            <div class="control-row">
+                                <div class="seg-tool-buttons">
+                                    <button type="button" id="segToolBrushBtn" class="seg-tool-button active">Brush</button>
+                                    <button type="button" id="segToolThresholdBtn" class="seg-tool-button">Threshold</button>
+                                    <button type="button" id="segToolGrowBtn" class="seg-tool-button">Region Grow</button>
+                                </div>
+                            </div>
+                            <div class="control-row" id="segBrushRow">
+                                <label>Brush Action</label>
+                                <div class="seg-tool-buttons two-col">
+                                    <button type="button" id="segBrushDrawBtn" class="seg-tool-button active">Draw</button>
+                                    <button type="button" id="segBrushEraseBtn" class="seg-tool-button">Erase</button>
+                                </div>
+                                <label for="segBrushSize">Brush Size <span id="segBrushSizeValue">8</span></label>
+                                <input type="range" id="segBrushSize" min="1" max="64" step="1" value="8">
+                            </div>
+                            <div class="control-row" id="segThresholdRow" style="display: none;">
+                                <label for="segThresholdMin">Threshold Min</label>
+                                <input type="number" id="segThresholdMin" value="0">
+                                <label for="segThresholdMax">Threshold Max</label>
+                                <input type="number" id="segThresholdMax" value="0">
+                            </div>
+                            <div class="control-row" id="segGrowRow" style="display: none;">
+                                <label for="segGrowTolerance">Grow Tolerance</label>
+                                <input type="number" id="segGrowTolerance" value="25">
+                                <label for="segGrowRadius">Slice Radius (2.5D)</label>
+                                <input type="number" id="segGrowRadius" min="0" max="2" step="1" value="1">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="about-popover" id="aboutPopover" aria-hidden="true" role="dialog" aria-label="About CTViewer WebGPU">
+                    <div class="about-title">CTViewer WebGPU</div>
+                    <div class="about-subtitle">High-performance browser volume rendering</div>
+                    <p class="about-body">A GPU-accelerated volume viewer with streaming data support, interactive multi-planar slices, and modern floating controls.</p>
+                    <div class="about-footer">WebGPU · MIP Raymarching · Streaming 3D Volumes</div>
+                </div>
+
                 <div class="image-wrapper" id="imageWrapper">
                     <div class="placeholder" id="placeholder">
-                        <p>Drop images here or click "Open" to select files</p>
-                        <p class="hint">Supports 2D: JPG, PNG, TIFF | 3D: RAW+metadata (.json/.volumeinfo/.dat), DICOM series, NIfTI</p>
+                        <p>Drop images here or click Open to select files</p>
+                        <p class="hint">Supports 2D: JPG, PNG, TIFF | 3D: RAW + metadata (.json/.volumeinfo/.dat), DICOM series, NIfTI</p>
                     </div>
 
                     <div id="ct3DView" class="ct-view" style="display: none;">
-                        <div class="viewport-container">
+                        <div class="viewport-container" data-axis="xy">
                             <span class="viewport-label">XY (Axial)</span>
                             <span class="lowres-indicator" id="lowresXY">LOW-RES</span>
                             <canvas id="canvasXY" class="viewport-canvas"></canvas>
                         </div>
-                        <div class="viewport-container">
+                        <div class="viewport-container" data-axis="xz">
                             <span class="viewport-label">XZ (Coronal)</span>
                             <span class="lowres-indicator" id="lowresXZ">LOW-RES</span>
                             <canvas id="canvasXZ" class="viewport-canvas"></canvas>
                         </div>
-                        <div class="viewport-container">
+                        <div class="viewport-container" data-axis="yz">
                             <span class="viewport-label">YZ (Sagittal)</span>
                             <span class="lowres-indicator" id="lowresYZ">LOW-RES</span>
                             <canvas id="canvasYZ" class="viewport-canvas"></canvas>
                         </div>
-                        <div class="viewport-container viewport-3d">
+                        <div class="viewport-container viewport-3d" data-axis="3d">
                             <span class="viewport-label">3D</span>
                             <span class="resolution-indicator" id="resolution3D"></span>
                             <canvas id="canvas3D" class="viewport-canvas"></canvas>
+
+                            <div class="viewport-3d-controls" id="viewport3DControls">
+                                <button id="viewport3DChip" class="viewport-3d-chip" title="3D rendering controls" aria-label="3D rendering controls">
+                                    <span id="resolutionChipText">Resolution: --</span>
+                                    <span id="resolution3DStatus" class="status-text"></span>
+                                </button>
+                                <div class="viewport-3d-panel" id="viewport3DPanel" aria-hidden="true">
+                                    <div class="floating-panel-group" id="quality3DGroup" style="display: none;">
+                                        <div class="group-title">3D Rendering</div>
+                                        <div class="control-row">
+                                            <label for="resolution3DSelect">Resolution</label>
+                                            <select id="resolution3DSelect">
+                                                <option value="low" selected>Low</option>
+                                                <option value="mid">Mid</option>
+                                                <option value="full">Full</option>
+                                            </select>
+                                        </div>
+                                        <div class="control-row">
+                                            <label for="quality3DSelect">Quality</label>
+                                            <select id="quality3DSelect">
+                                                <option value="low" selected>Low (Fast)</option>
+                                                <option value="medium">Medium</option>
+                                                <option value="high">High (Slow)</option>
+                                            </select>
+                                        </div>
+                                        <div class="control-row">
+                                            <label for="gamma3DSlider">Gamma <span id="gamma3DValue">1.0</span></label>
+                                            <input type="range" id="gamma3DSlider" min="0.1" max="4" step="0.1" value="1">
+                                        </div>
+                                        <div class="control-row">
+                                            <label for="renderModeSelect">Mode</label>
+                                            <select id="renderModeSelect">
+                                                <option value="0" selected>MIP</option>
+                                                <option value="1">MinIP</option>
+                                                <option value="2">Average</option>
+                                                <option value="3">Compositing</option>
+                                            </select>
+                                        </div>
+                                        <div class="control-row" id="tfPresetGroup" style="display: none;">
+                                            <label for="tfPresetSelect">Transfer Function</label>
+                                            <select id="tfPresetSelect"></select>
+                                        </div>
+                                        <div class="control-row" id="lightingGroup" style="display: none;">
+                                            <label><input type="checkbox" id="lightingToggle" checked> Lighting</label>
+                                        </div>
+                                    </div>
+
+                                </div>
+                            </div>
                         </div>
                     </div>
-                </div>
-            </div>
 
-            <div class="sidebar" id="ctControls">
-                <div class="sidebar-section" id="histogramGroup">
-                    <h4>Histogram</h4>
-                    <div class="histogram-container">
-                        <canvas id="histogramCanvas"></canvas>
-                        <div class="histogram-handles">
-                            <div class="handle handle-min" id="handleMin"></div>
-                            <div class="handle handle-max" id="handleMax"></div>
+                    <div class="histogram-overlay" id="histogramOverlay" aria-hidden="true">
+                        <div class="overlay-title-row">
+                            <div class="overlay-title-left">
+                                <div class="overlay-grip" id="histogramGrip" title="Drag histogram panel">::</div>
+                                <h4>Histogram</h4>
+                            </div>
+                            <div class="overlay-title-actions">
+                                <button id="histogramPinBtn" class="icon-btn close-btn" title="Pin histogram" aria-label="Pin Histogram">
+                                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                        <path d="M8 4h8l-1 5 3 3v1H6v-1l3-3z"></path>
+                                        <path d="M12 13v7"></path>
+                                    </svg>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="histogram-container">
+                            <canvas id="histogramCanvas"></canvas>
+                            <div class="histogram-handles">
+                                <div class="handle handle-min" id="handleMin"></div>
+                                <div class="handle handle-max" id="handleMax"></div>
+                            </div>
+                        </div>
+                        <div class="histogram-values">
+                            <span id="histogramMin">0</span>
+                            <span id="histogramMax">255</span>
                         </div>
                     </div>
-                    <div class="histogram-values">
-                        <span id="histogramMin">0</span>
-                        <span id="histogramMax">255</span>
-                    </div>
-                </div>
 
-                <div class="sidebar-section" id="toolControls">
-                    <h4>Tools</h4>
-                    <div class="tool-buttons">
-                        <button id="zoomInBtn" title="Zoom In (+)" class="tool-button">Zoom +</button>
-                        <button id="zoomOutBtn" title="Zoom Out (-)" class="tool-button">Zoom -</button>
-                        <button id="roiBtn" title="Set range from region (Esc to cancel)" disabled class="tool-button">ROI</button>
-                        <button id="crosshairBtn" title="Toggle crosshairs (C)" disabled class="tool-button">Crosshair</button>
-                    </div>
-                </div>
+                    <div class="segmentation-overlay" id="segmentationOverlay" aria-hidden="true">
+                        <div class="overlay-title-row">
+                            <div class="overlay-title-left">
+                                <div class="overlay-grip" id="segmentationGrip" title="Drag segmentation panel">::</div>
+                                <h4>Segmentation</h4>
+                            </div>
+                            <div class="overlay-title-actions">
+                                <button id="segmentationAddRoiBtn" class="icon-btn close-btn" title="Add ROI" aria-label="Add ROI">+</button>
+                                <button id="segmentationSettingsBtn" class="icon-btn close-btn" title="Segmentation settings" aria-label="Segmentation settings">S</button>
+                                <button id="segmentationPinBtn" class="icon-btn close-btn" title="Pin segmentation panel" aria-label="Pin segmentation panel">
+                                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                        <path d="M8 4h8l-1 5 3 3v1H6v-1l3-3z"></path>
+                                        <path d="M12 13v7"></path>
+                                    </svg>
+                                </button>
+                            </div>
+                        </div>
 
-                <div class="sidebar-section" id="sliceControls">
-                    <h4>Slices</h4>
-                    <div class="slice-indicators">
+                        <div class="seg-overlay-body">
+                            <div class="seg-section">
+                                <div class="seg-section-title">Mode</div>
+                                <div class="control-row">
+                                    <label><input type="checkbox" id="segEnableToggle"> Enable Editing</label>
+                                </div>
+                                <div class="control-row">
+                                    <label><input type="checkbox" id="segVisibleToggle" checked> Show Overlay</label>
+                                </div>
+                            </div>
+
+                            <div class="seg-section">
+                                <div class="seg-section-title">Tools</div>
+                                <div class="control-row">
+                                    <span>Tool controls are in the left mode panel while segmentation mode is active.</span>
+                                </div>
+                            </div>
+
+                            <div class="seg-section">
+                                <div class="seg-section-title">ROI List</div>
+                                <div class="seg-roi-list" id="segRoiList"></div>
+                            </div>
+
+                            <div class="seg-section">
+                                <div class="seg-section-title">ROI Management</div>
+                                <div class="seg-action-grid">
+                                    <button id="segDuplicateRoiBtn" class="seg-action-btn" type="button">Duplicate ROI</button>
+                                    <button id="segMergeRoiBtn" class="seg-action-btn" type="button">Merge ROI</button>
+                                    <button id="segExportRoiBtn" class="seg-action-btn" type="button">Export ROI</button>
+                                    <button id="segImportRoiBtn" class="seg-action-btn" type="button">Import ROI</button>
+                                </div>
+                            </div>
+
+                            <div class="seg-section">
+                                <div class="seg-section-title">Segmentation Package</div>
+                                <div class="seg-action-grid">
+                                    <button id="segExportSegBtn" class="seg-action-btn" type="button">Export Segmentation</button>
+                                    <button id="segImportSegBtn" class="seg-action-btn" type="button">Import Segmentation</button>
+                                </div>
+                            </div>
+
+                            <div class="seg-section">
+                                <div class="seg-section-title">Active ROI Stats</div>
+                                <div class="seg-stats-grid">
+                                    <span>Voxels</span><span id="segStatsVoxels">-</span>
+                                    <span>Volume</span><span id="segStatsVolume">-</span>
+                                    <span>Mean Intensity</span><span id="segStatsMean">-</span>
+                                    <span>Std Dev</span><span id="segStatsStd">-</span>
+                                </div>
+                            </div>
+
+                            <div class="seg-section">
+                                <div class="seg-section-title">Display</div>
+                                <div class="control-row">
+                                    <label><input type="checkbox" id="segShowOnlyActiveToggle"> Show only active ROI</label>
+                                </div>
+                                <div class="control-row">
+                                    <label for="segOpacitySlider">Overlay Opacity <span id="segOpacityValue">0.40</span></label>
+                                    <input type="range" id="segOpacitySlider" min="0" max="1" step="0.01" value="0.4">
+                                </div>
+                            </div>
+
+                            <div class="seg-section">
+                                <button id="segPropagateBtn" class="seg-action-btn" type="button">Propagate...</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="slice-overlay" id="sliceControls">
+                        <div class="slice-grip" id="sliceGrip" title="Drag slice info">::</div>
                         <span id="sliceIndicatorXY" class="slice-indicator">XY: 0/0</span>
                         <span id="sliceIndicatorXZ" class="slice-indicator">XZ: 0/0</span>
                         <span id="sliceIndicatorYZ" class="slice-indicator">YZ: 0/0</span>
-                    </div>
-                </div>
-
-                <div class="sidebar-section" id="pixelInfoGroup" style="display: none;">
-                    <h4>Pixel Value</h4>
-                    <span id="pixelInfo" class="slice-indicator">X: 0, Y: 0, Z: 0 = 0</span>
-                </div>
-
-                <div class="sidebar-section" id="quality3DGroup">
-                    <h4>3D Rendering</h4>
-                    <div class="control-row">
-                        <label for="resolution3DSelect">Resolution</label>
-                        <select id="resolution3DSelect">
-                            <option value="low" selected>Low</option>
-                            <option value="mid">Mid</option>
-                            <option value="full">Full</option>
-                        </select>
-                        <span id="resolution3DStatus" style="margin-left: 8px; font-size: 0.9em; color: var(--text-secondary);"></span>
-                    </div>
-                    <div class="control-row">
-                        <label for="quality3DSelect">Quality</label>
-                        <select id="quality3DSelect">
-                            <option value="low" selected>Low (Fast)</option>
-                            <option value="medium">Medium</option>
-                            <option value="high">High (Slow)</option>
-                        </select>
-                    </div>
-                    <div class="control-row">
-                        <label for="gamma3DSlider">Gamma <span id="gamma3DValue">1.0</span></label>
-                        <input type="range" id="gamma3DSlider" min="0.1" max="4" step="0.1" value="1">
-                    </div>
-                    <div class="control-row">
-                        <label for="renderModeSelect">Mode</label>
-                        <select id="renderModeSelect">
-                            <option value="0" selected>MIP</option>
-                            <option value="1">MinIP</option>
-                            <option value="2">Average</option>
-                            <option value="3">Compositing</option>
-                        </select>
-                    </div>
-                    <div class="control-row" id="tfPresetGroup" style="display: none;">
-                        <label for="tfPresetSelect">Transfer Function</label>
-                        <select id="tfPresetSelect"></select>
-                    </div>
-                    <div class="control-row" id="lightingGroup" style="display: none;">
-                        <label><input type="checkbox" id="lightingToggle" checked> Lighting</label>
+                        <span id="pixelInfoGroup" class="slice-indicator slice-value" style="display: none;">
+                            <span id="pixelInfo">X: 0, Y: 0, Z: 0 = 0</span>
+                        </span>
                     </div>
                 </div>
             </div>
@@ -146,6 +363,8 @@
     </div>
 
     <input type="file" id="fileInput" multiple accept="image/*,.raw,.json,.volumeinfo,.dat,.tif,.tiff,.dcm,.nii,.nii.gz" style="display: none;">
+    <input type="file" id="segRoiImportInput" accept=".json,application/json" style="display: none;">
+    <input type="file" id="segPackageImportInput" accept=".json,application/json" style="display: none;">
 
     <script type="module" src="/src/main.ts"></script>
 </body>

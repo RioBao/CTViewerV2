@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(npm install:*)",
+      "Bash(where:*)",
+      "Bash(where.exe npm)",
+      "Bash(cmd.exe /c \"npm --version\")",
+      "Bash(cmd.exe:*)",
+      "Bash(powershell.exe -Command \"Get-Command npm -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source; Get-Command node -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source\")",
+      "Bash(powershell.exe -Command \"& { $paths = @\\(''C:\\\\Program Files\\\\nodejs'', ''C:\\\\Program Files \\(x86\\)\\\\nodejs'', \"\"$env:APPDATA\\\\npm\"\", \"\"$env:LOCALAPPDATA\\\\Programs\\\\nodejs\"\"\\); foreach \\($p in $paths\\) { if \\(Test-Path $p\\) { Write-Output \"\"Found: $p\"\"; Get-ChildItem $p -Filter ''npm*'' -Name } } }\")",
+      "Bash(powershell.exe -Command \"Get-ChildItem ''C:\\\\Program Files\\\\nodejs'' -ErrorAction SilentlyContinue | Select-Object Name; Get-ChildItem ''C:\\\\Program Files \\(x86\\)\\\\nodejs'' -ErrorAction SilentlyContinue | Select-Object Name\")",
+      "Bash(powershell.exe:*)",
+      "Bash(test:*)",
+      "Bash(npx tsc:*)",
+      "Bash(node --version:*)",
+      "Bash(npm:*)",
+      "Bash(ls:*)",
+      "Bash(npx vite build:*)",
+      "Bash(xxd:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}

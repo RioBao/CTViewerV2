@@ -1,4 +1,4 @@
-import type { ViewAxis, ViewId } from '../types.js';
+import { AppMode, type ViewAxis, type ViewId, type SegmentationSettings } from '../types.js';
 
 /** Current viewer state */
 export interface ViewerState {
@@ -9,9 +9,10 @@ export interface ViewerState {
     slices: Record<ViewAxis, number>;
     activeView: ViewId | null;
     crosshairsEnabled: boolean;
-    roiMode: boolean;
+    appMode: AppMode;
     loading: boolean;
     gpuAvailable: boolean;
+    segmentation: SegmentationSettings;
 }
 
 /** Events emitted by the UI state manager */
@@ -42,9 +43,28 @@ export class UIState {
             slices: { xy: 0, xz: 0, yz: 0 },
             activeView: null,
             crosshairsEnabled: false,
-            roiMode: false,
+            appMode: AppMode.Viewing,
             loading: false,
             gpuAvailable: false,
+            segmentation: {
+                enabled: false,
+                visible: true,
+                overlayOpacity: 0.4,
+                color: [1.0, 0.0, 0.0],
+                activeROIId: null,
+                activeTool: 'brush',
+                showOnlyActive: false,
+                aiPreviewMask: null,
+                isPinned: false,
+                activeClassId: 1,
+                tool: 'brush',
+                brushRadius: 8,
+                paintValue: 1,
+                thresholdMin: 0,
+                thresholdMax: 0,
+                regionGrowTolerance: 25,
+                regionGrowSliceRadius: 1,
+            },
         };
     }
 

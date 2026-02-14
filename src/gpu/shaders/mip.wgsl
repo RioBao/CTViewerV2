@@ -41,6 +41,8 @@ struct Uniforms {
     brickGridX: f32,
     brickGridY: f32,
     brickGridZ: f32,
+    maskOverlayEnabled: f32,
+    maskOverlayOpacity: f32,
 };
 
 struct VertexOutput {
@@ -55,6 +57,8 @@ struct VertexOutput {
 @group(0) @binding(4) var tfSampler: sampler;
 @group(0) @binding(5) var brickTex: texture_3d<f32>;
 @group(0) @binding(6) var brickSampler: sampler;
+@group(0) @binding(7) var labelTex: texture_3d<u32>;
+@group(0) @binding(8) var maskPaletteTex: texture_2d<f32>;
 
 // Fullscreen triangle
 @vertex
@@ -138,6 +142,21 @@ fn lookupBrick(voxPos: vec3f) -> vec2f {
     return textureSampleLevel(brickTex, brickSampler, brickUVW, 0.0).rg;
 }
 
+fn sampleLabel(voxPos: vec3f) -> u32 {
+    let maxCoord = vec3i(
+        max(0, i32(u.dimX) - 1),
+        max(0, i32(u.dimY) - 1),
+        max(0, i32(u.dimZ) - 1),
+    );
+    let coord = clamp(vec3i(floor(voxPos)), vec3i(0), maxCoord);
+    return textureLoad(labelTex, coord, 0).r;
+}
+
+fn lookupMaskPalette(classId: u32) -> vec4f {
+    let index = clamp(i32(classId), 0, 255);
+    return textureLoad(maskPaletteTex, vec2i(index, 0), 0);
+}
+
 @fragment
 fn fs(in: VertexOutput) -> @location(0) vec4f {
     let dims = vec3f(u.dimX, u.dimY, u.dimZ);
@@ -199,6 +218,7 @@ fn fs(in: VertexOutput) -> @location(0) vec4f {
     var sumVal: f32 = 0.0;
     var sampleCount: f32 = 0.0;
     var accumColor = vec4f(0.0, 0.0, 0.0, 0.0);
+    var overlayAccum = vec4f(0.0, 0.0, 0.0, 0.0);
     var hitVolume = false;
 
     var t = tStart;
@@ -227,6 +247,18 @@ fn fs(in: VertexOutput) -> @location(0) vec4f {
         let volRange = u.displayMax - u.displayMin;
         let surfaceRatio = clamp(brickRange / max(volRange * 0.1, 0.001), 0.0, 1.0);
         let adaptiveStep = mix(baseStep * 2.0, baseStep * 0.5, surfaceRatio);
+
+        if (u.maskOverlayEnabled > 0.5) {
+            let classId = sampleLabel(voxPos);
+            if (classId > 0u) {
+                let palette = lookupMaskPalette(classId);
+                let overlayAlpha = clamp(palette.a * u.maskOverlayOpacity * adaptiveStep * 80.0, 0.0, 1.0);
+                if (overlayAlpha > 0.0001) {
+                    let srcOverlay = vec4f(palette.rgb * overlayAlpha, overlayAlpha);
+                    overlayAccum += srcOverlay * (1.0 - overlayAccum.a);
+                }
+            }
+        }
 
         switch mode {
             case 0u: { // MIP
@@ -277,7 +309,8 @@ fn fs(in: VertexOutput) -> @location(0) vec4f {
 
     // Mode 3 (Compositing): output accumulated color directly
     if (mode == 3u) {
-        return vec4f(accumColor.rgb, 1.0);
+        let blended = mix(accumColor.rgb, overlayAccum.rgb, overlayAccum.a);
+        return vec4f(blended, 1.0);
     }
 
     // For projection modes, determine the result value
@@ -298,5 +331,7 @@ fn fs(in: VertexOutput) -> @location(0) vec4f {
     // Gamma correction
     let corrected = pow(normalized, u.gamma);
 
-    return vec4f(corrected, corrected, corrected, 1.0);
+    let base = vec3f(corrected, corrected, corrected);
+    let blended = mix(base, overlayAccum.rgb, overlayAccum.a);
+    return vec4f(blended, 1.0);
 }

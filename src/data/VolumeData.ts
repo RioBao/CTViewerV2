@@ -1,4 +1,4 @@
-import type { VolumeMetadata, VoxelTypedArray, SliceData, ViewAxis } from '../types.js';
+﻿import type { VolumeMetadata, VoxelTypedArray, SliceData, ViewAxis } from '../types.js';
 
 /**
  * Core container for 3D volume data.
@@ -152,7 +152,7 @@ export class VolumeData {
         return null;
     }
 
-    /** Async slice access — wraps sync getSlice in a resolved Promise */
+    /** Async slice access â€” wraps sync getSlice in a resolved Promise */
     getSliceAsync(axis: ViewAxis, index: number): Promise<SliceData> {
         return Promise.resolve(this.getSlice(axis, index));
     }
@@ -162,12 +162,12 @@ export class VolumeData {
         return this;
     }
 
-    /** Trigger prefetch — no-op for in-memory volumes */
+    /** Trigger prefetch â€” no-op for in-memory volumes */
     prefetch(_axis: ViewAxis, _index: number): void {
         // no-op
     }
 
-    /** Cleanup — no-op for in-memory volumes */
+    /** Cleanup â€” no-op for in-memory volumes */
     dispose(): void {
         // no-op
     }
@@ -190,26 +190,73 @@ export class VolumeData {
         const dstNy = Math.ceil(ny / scale);
         const dstNz = Math.ceil(nz / scale);
 
-        console.log(`Downsampling 3D: Creating ${dstNx}×${dstNy}×${dstNz} volume (scale=${scale})`);
+        console.log(`Downsampling 3D: Creating ${dstNx}x${dstNy}x${dstNz} volume (scale=${scale})`);
 
         const enhancedData = new Float32Array(dstNx * dstNy * dstNz);
+        const xA = new Int32Array(dstNx);
+        const xB = new Int32Array(dstNx);
+        const xN = new Int32Array(dstNx);
+        for (let dx = 0; dx < dstNx; dx++) {
+            const x0 = dx * scale;
+            const x1 = Math.min(x0 + scale, nx);
+            const count = x1 - x0;
+            xA[dx] = x0;
+            xB[dx] = count > 1 ? (x1 - 1) : x0;
+            xN[dx] = count > 1 ? 2 : 1;
+        }
+        const yA = new Int32Array(dstNy);
+        const yB = new Int32Array(dstNy);
+        const yN = new Int32Array(dstNy);
+        for (let dy = 0; dy < dstNy; dy++) {
+            const y0 = dy * scale;
+            const y1 = Math.min(y0 + scale, ny);
+            const count = y1 - y0;
+            yA[dy] = y0;
+            yB[dy] = count > 1 ? (y1 - 1) : y0;
+            yN[dy] = count > 1 ? 2 : 1;
+        }
+        const xySampleCounts = new Int32Array(dstNx * dstNy);
+        for (let dy = 0; dy < dstNy; dy++) {
+            const row = dy * dstNx;
+            for (let dx = 0; dx < dstNx; dx++) {
+                xySampleCounts[row + dx] = xN[dx] * yN[dy];
+            }
+        }
 
         for (let dz = 0; dz < dstNz; dz++) {
-            const srcZ = dz * scale;
-            if (srcZ >= nz) break;
-            const srcZOffset = srcZ * nx * ny;
+            const z0 = dz * scale;
+            const z1 = Math.min(z0 + scale, nz);
+            const zCount = z1 - z0;
+            const zN = zCount > 1 ? 2 : 1;
+            const zFirst = z0;
+            const zLast = zCount > 1 ? (z1 - 1) : z0;
             const dstZOffset = dz * dstNx * dstNy;
 
             for (let dy = 0; dy < dstNy; dy++) {
-                const srcY = dy * scale;
-                if (srcY >= ny) break;
-                const srcYOffset = srcZOffset + srcY * nx;
+                const yFirst = yA[dy];
+                const yLast = yB[dy];
+                const yCount = yN[dy];
                 const dstYOffset = dstZOffset + dy * dstNx;
 
                 for (let dx = 0; dx < dstNx; dx++) {
-                    const srcX = dx * scale;
-                    if (srcX >= nx) break;
-                    enhancedData[dstYOffset + dx] = this.data[srcYOffset + srcX];
+                    const xFirst = xA[dx];
+                    const xLast = xB[dx];
+                    const xCount = xN[dx];
+
+                    let sum = 0;
+                    for (let sz = 0; sz < zN; sz++) {
+                        const z = sz === 0 ? zFirst : zLast;
+                        const zOffset = z * nx * ny;
+                        for (let sy = 0; sy < yCount; sy++) {
+                            const y = sy === 0 ? yFirst : yLast;
+                            const rowOffset = zOffset + y * nx;
+                            sum += this.data[rowOffset + xFirst];
+                            if (xCount > 1) sum += this.data[rowOffset + xLast];
+                        }
+                    }
+
+                    const count = xySampleCounts[dy * dstNx + dx] * zN;
+                    enhancedData[dstYOffset + dx] = sum / count;
                 }
             }
 
@@ -227,6 +274,11 @@ export class VolumeData {
             {
                 ...this.metadata,
                 dimensions: [dstNx, dstNy, dstNz],
+                spacing: [
+                    this.spacing[0] * scale,
+                    this.spacing[1] * scale,
+                    this.spacing[2] * scale,
+                ],
                 dataType: 'float32'
             }
         );
@@ -243,3 +295,4 @@ export class VolumeData {
         return [min, max];
     }
 }
+

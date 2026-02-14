@@ -1,6 +1,9 @@
 import type { WebGPUContext } from './WebGPUContext.js';
-import type { SliceData } from '../types.js';
+import type { MaskTypedArray, SliceData } from '../types.js';
 import shaderSource from './shaders/slice.wgsl?raw';
+
+const MASK_PALETTE_SIZE = 256;
+const MASK_PALETTE_STRIDE = 4;
 
 /**
  * Renders a 2D slice to a canvas using WebGPU.
@@ -13,8 +16,13 @@ export class SliceRenderer {
     private pipeline: GPURenderPipeline;
     private uniformBuffer: GPUBuffer;
     private sliceBuffer: GPUBuffer | null = null;
+    private maskBuffer: GPUBuffer | null = null;
+    private emptyMaskBuffer: GPUBuffer;
+    private maskPaletteBuffer: GPUBuffer;
     private bindGroup: GPUBindGroup | null = null;
     private bindGroupLayout: GPUBindGroupLayout;
+    private maskStaging = new Uint32Array(0);
+    private maskPaletteStaging = new Float32Array(MASK_PALETTE_SIZE * MASK_PALETTE_STRIDE);
 
     private windowMin = 0;
     private windowMax = 255;
@@ -31,6 +39,12 @@ export class SliceRenderer {
     crosshairX = -1;
     crosshairY = -1;
     crosshairEnabled = false;
+    private rotationQuarter = 0; // 0,1,2,3 = 0,90,180,270 clockwise
+
+    // Segmentation overlay
+    maskOverlayEnabled = false;
+    maskOverlayOpacity = 0.4;
+    maskOverlayColor: [number, number, number] = [1.0, 0.0, 0.0];
 
     constructor(gpu: WebGPUContext, canvas: HTMLCanvasElement) {
         this.gpu = gpu;
@@ -42,14 +56,40 @@ export class SliceRenderer {
 
         // 12 floats × 4 bytes = 48 bytes (padded to 48)
         this.uniformBuffer = device.createBuffer({
-            size: 48,
+            size: 96,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+        this.emptyMaskBuffer = device.createBuffer({
+            size: 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        this.maskPaletteBuffer = device.createBuffer({
+            size: this.maskPaletteStaging.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
+        // Default palette: class 0 transparent, other classes red.
+        for (let i = 0; i < MASK_PALETTE_SIZE; i++) {
+            const base = i * MASK_PALETTE_STRIDE;
+            this.maskPaletteStaging[base] = 1.0;
+            this.maskPaletteStaging[base + 1] = 0.0;
+            this.maskPaletteStaging[base + 2] = 0.0;
+            this.maskPaletteStaging[base + 3] = i === 0 ? 0.0 : 1.0;
+        }
+        device.queue.writeBuffer(
+            this.maskPaletteBuffer,
+            0,
+            this.maskPaletteStaging.buffer,
+            this.maskPaletteStaging.byteOffset,
+            this.maskPaletteStaging.byteLength,
+        );
 
         this.bindGroupLayout = device.createBindGroupLayout({
             entries: [
                 { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
                 { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+                { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
             ],
         });
 
@@ -72,8 +112,8 @@ export class SliceRenderer {
         });
     }
 
-    /** Upload new slice data to the GPU */
-    updateSlice(slice: SliceData): void {
+    /** Upload new slice data (and optional mask) to the GPU */
+    updateSlice(slice: SliceData, maskData?: MaskTypedArray | null): void {
         const device = this.gpu.device;
         const { data, width, height } = slice;
 
@@ -95,22 +135,69 @@ export class SliceRenderer {
 
         device.queue.writeBuffer(this.sliceBuffer, 0, f32.buffer, f32.byteOffset, f32.byteLength);
 
+        let maskResource = this.emptyMaskBuffer;
+        if (maskData && maskData.length === width * height) {
+            const maskByteLength = maskData.length * 4;
+            if (!this.maskBuffer || this.maskBuffer.size < maskByteLength) {
+                this.maskBuffer?.destroy();
+                this.maskBuffer = device.createBuffer({
+                    size: maskByteLength,
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+                });
+            }
+
+            if (this.maskStaging.length !== maskData.length) {
+                this.maskStaging = new Uint32Array(maskData.length);
+            }
+            for (let i = 0; i < maskData.length; i++) {
+                this.maskStaging[i] = maskData[i];
+            }
+            device.queue.writeBuffer(
+                this.maskBuffer,
+                0,
+                this.maskStaging.buffer,
+                this.maskStaging.byteOffset,
+                this.maskStaging.byteLength,
+            );
+            maskResource = this.maskBuffer;
+        }
+
         // Recreate bind group with new buffer
         this.bindGroup = device.createBindGroup({
             layout: this.bindGroupLayout,
             entries: [
                 { binding: 0, resource: { buffer: this.uniformBuffer } },
                 { binding: 1, resource: { buffer: this.sliceBuffer } },
+                { binding: 2, resource: { buffer: maskResource } },
+                { binding: 3, resource: { buffer: this.maskPaletteBuffer } },
             ],
         });
 
         this.hasData = true;
     }
 
+    /** Upload per-class overlay palette as [r,g,b,a] * 256 entries. */
+    setMaskPalette(palette: Float32Array): void {
+        const required = MASK_PALETTE_SIZE * MASK_PALETTE_STRIDE;
+        if (palette.length < required) return;
+        this.gpu.device.queue.writeBuffer(
+            this.maskPaletteBuffer,
+            0,
+            palette.buffer,
+            palette.byteOffset,
+            required * 4,
+        );
+    }
+
     /** Set window/level range */
     setWindow(min: number, max: number): void {
         this.windowMin = min;
         this.windowMax = max;
+    }
+
+    /** Set rotation in 90deg clockwise steps */
+    setRotationQuarter(quarterTurns: number): void {
+        this.rotationQuarter = ((quarterTurns % 4) + 4) % 4;
     }
 
     /** Get current window range */
@@ -127,8 +214,13 @@ export class SliceRenderer {
         if (w === 0 || h === 0) return [-1, -1];
 
         const fitScale = Math.min(cw / w, ch / h);
-        const sx = (canvasX - cw / 2) / (fitScale * this.zoom) - this.panX + w / 2;
-        const sy = (canvasY - ch / 2) / (fitScale * this.zoom) - this.panY + h / 2;
+        const [rx, ry] = this.rotateCanvasDelta(
+            canvasX - cw / 2,
+            canvasY - ch / 2,
+            (4 - this.rotationQuarter) % 4,
+        );
+        const sx = rx / (fitScale * this.zoom) - this.panX + w / 2;
+        const sy = ry / (fitScale * this.zoom) - this.panY + h / 2;
         return [sx, sy];
     }
 
@@ -141,7 +233,8 @@ export class SliceRenderer {
         if (w === 0 || h === 0) return [0, 0];
 
         const fitScale = Math.min(cw / w, ch / h);
-        return [dx / (fitScale * this.zoom), dy / (fitScale * this.zoom)];
+        const [rdx, rdy] = this.rotateCanvasDelta(dx, dy, (4 - this.rotationQuarter) % 4);
+        return [rdx / (fitScale * this.zoom), rdy / (fitScale * this.zoom)];
     }
 
     /** Get slice dimensions */
@@ -158,7 +251,7 @@ export class SliceRenderer {
         const cw = this.canvas.width;
         const ch = this.canvas.height;
 
-        // Update uniforms (12 floats)
+        // Update uniforms
         const uniforms = new Float32Array([
             this.windowMin,
             this.windowMax,
@@ -172,6 +265,18 @@ export class SliceRenderer {
             this.crosshairX,
             this.crosshairY,
             this.crosshairEnabled ? 1.0 : 0.0,
+            this.rotationQuarter,
+            this.maskOverlayEnabled ? 1.0 : 0.0,
+            this.maskOverlayOpacity,
+            this.maskOverlayColor[0],
+            this.maskOverlayColor[1],
+            this.maskOverlayColor[2],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
         ]);
         device.queue.writeBuffer(this.uniformBuffer, 0, uniforms.buffer, uniforms.byteOffset, uniforms.byteLength);
 
@@ -218,7 +323,19 @@ export class SliceRenderer {
 
     destroy(): void {
         this.sliceBuffer?.destroy();
+        this.maskBuffer?.destroy();
+        this.emptyMaskBuffer.destroy();
+        this.maskPaletteBuffer.destroy();
         this.uniformBuffer.destroy();
         this.hasData = false;
+    }
+
+    private rotateCanvasDelta(x: number, y: number, quarterTurns: number): [number, number] {
+        switch (((quarterTurns % 4) + 4) % 4) {
+            case 1: return [-y, x];
+            case 2: return [-x, -y];
+            case 3: return [y, -x];
+            default: return [x, y];
+        }
     }
 }

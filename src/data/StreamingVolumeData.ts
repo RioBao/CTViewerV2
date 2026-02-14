@@ -1,4 +1,4 @@
-import type { VolumeMetadata, VoxelDataType, VoxelTypedArray, SliceData, ViewAxis } from '../types.js';
+﻿import type { VolumeMetadata, VoxelDataType, VoxelTypedArray, SliceData, ViewAxis } from '../types.js';
 import { VolumeData } from './VolumeData.js';
 
 const LRU_CACHE_SIZE = 100;
@@ -48,7 +48,7 @@ export class StreamingVolumeData {
     readonly min: number;
     readonly max: number;
 
-    /** Callback fired when an async slice is ready — ViewerApp should re-render */
+    /** Callback fired when an async slice is ready â€” ViewerApp should re-render */
     onSliceReady: ((axis: ViewAxis, index: number) => void) | null = null;
 
     private file: File;
@@ -62,7 +62,7 @@ export class StreamingVolumeData {
     // Serialized I/O queue for XY reads only
     private xyQueue: Promise<void> = Promise.resolve();
 
-    // Prefetch tracking — limits concurrent reads
+    // Prefetch tracking â€” limits concurrent reads
     private prefetchInProgress = new Set<number>();
 
     // Separate XZ/YZ caches (one slot each, like old viewer)
@@ -90,7 +90,7 @@ export class StreamingVolumeData {
     }
 
     /**
-     * Synchronous slice access — returns cached full-res or upscaled low-res fallback.
+     * Synchronous slice access â€” returns cached full-res or upscaled low-res fallback.
      * Always returns immediately.
      */
     getSlice(axis: ViewAxis, index: number): SliceData {
@@ -118,7 +118,7 @@ export class StreamingVolumeData {
     }
 
     /**
-     * Async slice access — reads from file and caches. Returns full-res data.
+     * Async slice access â€” reads from file and caches. Returns full-res data.
      * For XY: single contiguous read via serialized queue.
      * For XZ/YZ: independent slab-based progressive loading with cancellation.
      */
@@ -246,7 +246,7 @@ export class StreamingVolumeData {
     // XY slice reading (serialized queue, like old viewer's readBlob chain)
     // ========================================================================
 
-    /** Read a single XY slice — contiguous in file, fast (~4MB, <50ms) */
+    /** Read a single XY slice â€” contiguous in file, fast (~4MB, <50ms) */
     private readXYSlice(index: number): Promise<SliceData> {
         // Already cached?
         const cached = this.xyCache.get(index);
@@ -283,7 +283,7 @@ export class StreamingVolumeData {
     }
 
     // ========================================================================
-    // XZ slice loading — independent async, cancellation, center-out slabs
+    // XZ slice loading â€” independent async, cancellation, center-out slabs
     // ========================================================================
 
     /**
@@ -379,7 +379,7 @@ export class StreamingVolumeData {
     }
 
     // ========================================================================
-    // YZ slice loading — independent async, cancellation, center-out slabs
+    // YZ slice loading â€” independent async, cancellation, center-out slabs
     // ========================================================================
 
     /**
@@ -547,7 +547,7 @@ export class StreamingVolumeData {
     }
 
     /**
-     * Create a downsampled 3D volume by streaming through the file.
+     * Create an anti-aliased downsampled 3D volume by streaming through the file.
      * @param scale Downsample factor (2 = half resolution, 4 = quarter)
      */
     async createDownsampledVolume(scale: number, onProgress?: (progress: number) => void): Promise<VolumeData | null> {
@@ -556,33 +556,80 @@ export class StreamingVolumeData {
         const dstNy = Math.ceil(ny / scale);
         const dstNz = Math.ceil(nz / scale);
 
-        console.log(`Downsampling 3D: Creating ${dstNx}×${dstNy}×${dstNz} volume (scale=${scale})`);
+        console.log(`Downsampling 3D: Creating ${dstNx}x${dstNy}x${dstNz} volume (scale=${scale})`);
 
         const enhancedData = new Float32Array(dstNx * dstNy * dstNz);
+        const xA = new Int32Array(dstNx);
+        const xB = new Int32Array(dstNx);
+        const xN = new Int32Array(dstNx);
+        for (let dx = 0; dx < dstNx; dx++) {
+            const x0 = dx * scale;
+            const x1 = Math.min(x0 + scale, nx);
+            const count = x1 - x0;
+            xA[dx] = x0;
+            xB[dx] = count > 1 ? (x1 - 1) : x0;
+            xN[dx] = count > 1 ? 2 : 1;
+        }
+        const yA = new Int32Array(dstNy);
+        const yB = new Int32Array(dstNy);
+        const yN = new Int32Array(dstNy);
+        for (let dy = 0; dy < dstNy; dy++) {
+            const y0 = dy * scale;
+            const y1 = Math.min(y0 + scale, ny);
+            const count = y1 - y0;
+            yA[dy] = y0;
+            yB[dy] = count > 1 ? (y1 - 1) : y0;
+            yN[dy] = count > 1 ? 2 : 1;
+        }
+        const xySampleCounts = new Int32Array(dstNx * dstNy);
+        for (let dy = 0; dy < dstNy; dy++) {
+            const row = dy * dstNx;
+            for (let dx = 0; dx < dstNx; dx++) {
+                xySampleCounts[row + dx] = xN[dx] * yN[dy];
+            }
+        }
 
         for (let dz = 0; dz < dstNz; dz++) {
-            const srcZ = dz * scale;
-            if (srcZ >= nz) break;
+            const z0 = dz * scale;
+            const z1 = Math.min(z0 + scale, nz);
+            const zCount = z1 - z0;
+            const zN = zCount > 1 ? 2 : 1;
+            const zFirst = z0;
+            const zLast = zCount > 1 ? (z1 - 1) : z0;
+            const accum = new Float64Array(dstNx * dstNy);
 
-            // Read one XY slice from file
-            const offset = srcZ * this.sliceBytes;
-            const blob = this.file.slice(offset, offset + this.sliceBytes);
-            const buffer = await blob.arrayBuffer();
-            const srcSlice = bufferToTypedArray(buffer, this.dataType, nx * ny);
+            for (let sz = 0; sz < zN; sz++) {
+                const z = sz === 0 ? zFirst : zLast;
+                const offset = z * this.sliceBytes;
+                const blob = this.file.slice(offset, offset + this.sliceBytes);
+                const buffer = await blob.arrayBuffer();
+                const srcSlice = bufferToTypedArray(buffer, this.dataType, nx * ny);
 
-            // Downsample this slice in XY
-            const dstZOffset = dz * dstNx * dstNy;
-            for (let dy = 0; dy < dstNy; dy++) {
-                const srcY = dy * scale;
-                if (srcY >= ny) break;
-                const srcYOffset = srcY * nx;
-                const dstYOffset = dstZOffset + dy * dstNx;
+                for (let dy = 0; dy < dstNy; dy++) {
+                    const yFirst = yA[dy];
+                    const yLast = yB[dy];
+                    const yCount = yN[dy];
+                    const outRow = dy * dstNx;
 
-                for (let dx = 0; dx < dstNx; dx++) {
-                    const srcX = dx * scale;
-                    if (srcX >= nx) break;
-                    enhancedData[dstYOffset + dx] = srcSlice[srcYOffset + srcX];
+                    for (let dx = 0; dx < dstNx; dx++) {
+                        const xFirst = xA[dx];
+                        const xLast = xB[dx];
+                        const xCount = xN[dx];
+                        let sum2D = 0;
+                        for (let sy = 0; sy < yCount; sy++) {
+                            const y = sy === 0 ? yFirst : yLast;
+                            const rowOffset = y * nx;
+                            sum2D += srcSlice[rowOffset + xFirst];
+                            if (xCount > 1) sum2D += srcSlice[rowOffset + xLast];
+                        }
+                        accum[outRow + dx] += sum2D;
+                    }
                 }
+            }
+
+            const dstZOffset = dz * dstNx * dstNy;
+            for (let i = 0; i < accum.length; i++) {
+                enhancedData[dstZOffset + i] = accum[i] / (xySampleCounts[i] * zN);
             }
 
             if (onProgress && dz % Math.max(1, Math.floor(dstNz / 20)) === 0) {
@@ -599,8 +646,14 @@ export class StreamingVolumeData {
             {
                 ...this.metadata,
                 dimensions: [dstNx, dstNy, dstNz],
+                spacing: [
+                    this.spacing[0] * scale,
+                    this.spacing[1] * scale,
+                    this.spacing[2] * scale,
+                ],
                 dataType: 'float32'
             }
         );
     }
 }
+

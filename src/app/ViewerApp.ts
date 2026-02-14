@@ -6,10 +6,86 @@ import { FilePicker, type FileGroup } from './FilePicker.js';
 import { loadVolume } from '../loaders/VolumeLoader.js';
 import type { VolumeData } from '../data/VolumeData.js';
 import type { StreamingVolumeData } from '../data/StreamingVolumeData.js';
-import type { ViewAxis } from '../types.js';
+import { VolumeStore } from '../data/VolumeStore.js';
+import { AppMode, type MaskTypedArray, type SegmentationSettings, type SegmentationTool, type ViewAxis } from '../types.js';
+import type { MaskVolume } from '../segmentation/MaskTypes.js';
+import { hexToRgb01, type ROIEntry } from '../segmentation/ROIModel.js';
+import type { SegmentationOp } from '../segmentation/OpsQueue.js';
+import { createPaintStrokeOp } from '../segmentation/ops/PaintStrokeOp.js';
+import { createApplySliceSelectionOp } from '../segmentation/ops/ApplySliceSelectionOp.js';
+import { SegmentationWorkerClient } from '../segmentation/SegmentationWorkerClient.js';
+import { ROIRegistry } from '../segmentation/ROIRegistry.js';
+import { SegmentationStore, type SegmentationTilesSnapshot } from '../segmentation/SegmentationStore.js';
+import type { BinaryMaskRLEJson } from '../segmentation/MaskPersistence.js';
 
 const DEG = Math.PI / 180;
 const AXES: ViewAxis[] = ['xy', 'xz', 'yz'];
+type QualityPreset = 'low' | 'medium' | 'high';
+const MAX_REGION_GROW_SLICE_RADIUS = 2;
+const ACTIVE_ROI_STATS_DEBOUNCE_MS = 220;
+const ACTIVE_ROI_STATS_CHUNK_TARGET_VOXELS = 1_200_000;
+const BRICK_SIZE = 8;
+const MAX_SAFE_3D_UPLOAD_BYTES = 384 * 1024 * 1024; // 384 MB conservative budget
+const MASK_3D_SYNC_IDLE_MS = 48;
+const MASK_3D_SYNC_DRAG_MS = 140;
+
+interface ActiveRoiStatsAccumulator {
+    roiId: string;
+    classId: number;
+    voxels: number;
+    sampleCount: number;
+    sum: number;
+    sumSq: number;
+}
+
+interface SliceHit {
+    renderer: SliceRenderer;
+    sliceIndex: number;
+    sliceX: number;
+    sliceY: number;
+}
+
+interface RoiMaskPayload {
+    format: 'viewer-roi-mask-v1';
+    name: string;
+    colorHex?: string;
+    classId: number;
+    dimensions: [number, number, number];
+    spacing: [number, number, number];
+    voxelCount: number;
+    mask: BinaryMaskRLEJson;
+}
+
+interface SegmentationRoiMeta {
+    id: string;
+    classId: number;
+    name: string;
+    colorHex: string;
+    visible: boolean;
+    locked: boolean;
+}
+
+interface SegmentationPackagePayload {
+    format: 'viewer-segmentation-package-v1';
+    dimensions: [number, number, number];
+    spacing: [number, number, number];
+    classDataType: 'uint8' | 'uint16';
+    chunkSize: number;
+    tiles: SegmentationTilesSnapshot['tiles'];
+    rois: SegmentationRoiMeta[];
+}
+
+interface Mask3DLookupCache {
+    srcDims: [number, number, number];
+    dstDims: [number, number, number];
+    xStart: Int32Array;
+    xEnd: Int32Array;
+    yStart: Int32Array;
+    yEnd: Int32Array;
+    zStart: Int32Array;
+    zEnd: Int32Array;
+    conservative: boolean;
+}
 
 /**
  * Top-level application orchestrator.
@@ -19,16 +95,36 @@ export class ViewerApp {
     private gpu: WebGPUContext | null = null;
     private uiState = new UIState();
     private filePicker: FilePicker | null = null;
-    private volume: VolumeData | StreamingVolumeData | null = null;
+    private volumeStore = new VolumeStore();
+    private segmentationStore = new SegmentationStore(512);
+    private roiRegistry = new ROIRegistry();
+    private maskSliceBuffers: Record<ViewAxis, MaskTypedArray | null> = { xy: null, xz: null, yz: null };
+    private maskDisplaySliceBuffers: Record<ViewAxis, MaskTypedArray | null> = { xy: null, xz: null, yz: null };
+    private maskPaletteData = new Float32Array(256 * 4);
+    private statsRefreshTimer: number | null = null;
+    private statsRefreshQueued = false;
+    private lastStatsRefreshAt = 0;
+    private activeRoiStats: ActiveRoiStatsAccumulator | null = null;
+    private activeRoiStatsDirty = true;
+    private activeRoiStatsRebuilding = false;
+    private activeRoiStatsRebuildToken = 0;
+    private activeRoiStatsRebuildTimer: number | null = null;
+    private mask3DDirty = true;
+    private mask3DPaletteDirty = true;
+    private mask3DSyncTimer: number | null = null;
+    private mask3DSyncWantsRender = false;
+    private mask3DLastSyncAt = 0;
+    private mask3DLabelBuffer: Uint8Array | null = null;
+    private mask3DLookupCache: Mask3DLookupCache | null = null;
+    private segmentationWorker = new SegmentationWorkerClient();
+    private segmentationWorkerBusy = false;
+    private activePaintStrokeId: number | null = null;
+    private nextPaintStrokeId = 1;
 
     // Renderers
     private sliceRenderers: Record<ViewAxis, SliceRenderer | null> = { xy: null, xz: null, yz: null };
     private sliceCanvases: Record<ViewAxis, HTMLCanvasElement | null> = { xy: null, xz: null, yz: null };
     private mipRenderer: MIPRenderer | null = null;
-
-    // 3D resolution management
-    private current3DResolution: 'low' | 'mid' | 'full' = 'low';
-    private cached3DVolumes = new Map<string, VolumeData>();
 
     // Crosshair state (volume voxel coords)
     private crosshairPos = { x: 0, y: 0, z: 0 };
@@ -41,7 +137,6 @@ export class ViewerApp {
     private histDragging: 'min' | 'max' | null = null;
 
     // ROI selection
-    private roiMode = false;
     private roiDragging = false;
     private roiAxis: ViewAxis | null = null;
     private roiStartCSS = { x: 0, y: 0 };
@@ -62,11 +157,48 @@ export class ViewerApp {
     private slice2DStartX = 0;
     private slice2DStartY = 0;
     private slice2DDragAxis: ViewAxis | null = null;
+    private segmentationDragging = false;
+    private segmentationDragAxis: ViewAxis | null = null;
+    private viewRotationQuarter = 0; // 0..3, clockwise 90deg steps for all views
 
     // Render scheduling
     private renderPending = false;
+    private pendingAxisRenders = new Set<ViewAxis>();
+    private axisRenderPending = false;
+    private preferred3DQuality: QualityPreset = 'low';
+    private interactionQualityActive = false;
+    private interactionQualityTimer: number | null = null;
+    private overlayState = {
+        histogramOpen: false,
+        histogramPinned: false,
+        aboutOpen: false,
+        threeDPanelOpen: false,
+        toolDockDragging: false,
+        toolDockStartX: 0,
+        toolDockStartY: 0,
+        toolDockStartLeft: 16,
+        toolDockStartTop: 80,
+        histogramDragging: false,
+        histogramStartX: 0,
+        histogramStartY: 0,
+        histogramStartLeft: 0,
+        histogramStartTop: 80,
+        segmentationDragging: false,
+        segmentationStartX: 0,
+        segmentationStartY: 0,
+        segmentationStartLeft: 0,
+        segmentationStartTop: 268,
+        sliceDragging: false,
+        sliceStartX: 0,
+        sliceStartY: 0,
+        sliceStartLeft: 16,
+        sliceStartTop: 16,
+        topOverlayTimer: null as number | null,
+        threeDControlsTimer: null as number | null,
+    };
 
     // DOM references
+    private dropZoneEl!: HTMLElement;
     private canvas3D!: HTMLCanvasElement;
     private fileNameEl!: HTMLElement;
     private imageInfoEl!: HTMLElement;
@@ -79,9 +211,62 @@ export class ViewerApp {
     private pixelInfoEl!: HTMLElement;
     private pixelInfoGroup!: HTMLElement;
     private viewportContainers!: Record<string, HTMLElement>;
+    private topOverlay: HTMLElement | null = null;
+    private toolDock: HTMLElement | null = null;
+    private toolDockGrip: HTMLElement | null = null;
+    private dockLogoBtn: HTMLElement | null = null;
+    private aboutPopover: HTMLElement | null = null;
+    private histogramOverlay: HTMLElement | null = null;
+    private histogramGrip: HTMLElement | null = null;
+    private histogramToggleBtn: HTMLElement | null = null;
+    private histogramPinBtn: HTMLElement | null = null;
+    private segmentationOverlay: HTMLElement | null = null;
+    private segmentationGrip: HTMLElement | null = null;
+    private segmentationPinBtn: HTMLElement | null = null;
+    private segmentationAddRoiBtn: HTMLElement | null = null;
+    private segmentationSettingsBtn: HTMLElement | null = null;
+    private segRoiList: HTMLElement | null = null;
+    private segModeBtn: HTMLElement | null = null;
+    private toolModePanel: HTMLElement | null = null;
+    private toolModeViewing: HTMLElement | null = null;
+    private toolModeMeasuring: HTMLElement | null = null;
+    private toolModeSegmentation: HTMLElement | null = null;
+    private sliceControls: HTMLElement | null = null;
+    private sliceGrip: HTMLElement | null = null;
+    private viewport3DControls: HTMLElement | null = null;
+    private viewport3DChip: HTMLElement | null = null;
+    private viewport3DPanel: HTMLElement | null = null;
+    private resolutionChipText: HTMLElement | null = null;
+    private segRoiImportInput: HTMLInputElement | null = null;
+    private segPackageImportInput: HTMLInputElement | null = null;
+
+    private get maskVolume(): MaskVolume | null {
+        return this.segmentationStore.maskVolume;
+    }
+
+    private get roiEntries(): ROIEntry[] {
+        return this.roiRegistry.entries;
+    }
+
+    private get volume(): VolumeData | StreamingVolumeData | null {
+        return this.volumeStore.volume;
+    }
+
+    private set volume(next: VolumeData | StreamingVolumeData | null) {
+        this.volumeStore.volume = next;
+    }
+
+    private get current3DResolution(): 'low' | 'mid' | 'full' {
+        return this.volumeStore.current3DResolution;
+    }
+
+    private set current3DResolution(next: 'low' | 'mid' | 'full') {
+        this.volumeStore.current3DResolution = next;
+    }
 
     async initialize(): Promise<void> {
         // Grab DOM references
+        this.dropZoneEl = document.getElementById('dropZone') as HTMLElement;
         this.canvas3D = document.getElementById('canvas3D') as HTMLCanvasElement;
         this.fileNameEl = document.getElementById('fileName') as HTMLElement;
         this.imageInfoEl = document.getElementById('imageInfo') as HTMLElement;
@@ -92,6 +277,34 @@ export class ViewerApp {
         this.histogramCanvas = document.getElementById('histogramCanvas') as HTMLCanvasElement;
         this.pixelInfoEl = document.getElementById('pixelInfo') as HTMLElement;
         this.pixelInfoGroup = document.getElementById('pixelInfoGroup') as HTMLElement;
+        this.topOverlay = document.getElementById('topOverlay');
+        this.toolDock = document.getElementById('toolDock');
+        this.toolDockGrip = document.getElementById('toolDockGrip');
+        this.dockLogoBtn = document.getElementById('dockLogoBtn');
+        this.aboutPopover = document.getElementById('aboutPopover');
+        this.histogramOverlay = document.getElementById('histogramOverlay');
+        this.histogramGrip = document.getElementById('histogramGrip');
+        this.histogramToggleBtn = document.getElementById('histogramToggleBtn');
+        this.histogramPinBtn = document.getElementById('histogramPinBtn');
+        this.segmentationOverlay = document.getElementById('segmentationOverlay');
+        this.segmentationGrip = document.getElementById('segmentationGrip');
+        this.segmentationPinBtn = document.getElementById('segmentationPinBtn');
+        this.segmentationAddRoiBtn = document.getElementById('segmentationAddRoiBtn');
+        this.segmentationSettingsBtn = document.getElementById('segmentationSettingsBtn');
+        this.segRoiList = document.getElementById('segRoiList');
+        this.segModeBtn = document.getElementById('segModeBtn');
+        this.toolModePanel = document.getElementById('toolModePanel');
+        this.toolModeViewing = document.getElementById('toolModeViewing');
+        this.toolModeMeasuring = document.getElementById('toolModeMeasuring');
+        this.toolModeSegmentation = document.getElementById('toolModeSegmentation');
+        this.sliceControls = document.getElementById('sliceControls');
+        this.sliceGrip = document.getElementById('sliceGrip');
+        this.viewport3DControls = document.getElementById('viewport3DControls');
+        this.viewport3DChip = document.getElementById('viewport3DChip');
+        this.viewport3DPanel = document.getElementById('viewport3DPanel');
+        this.resolutionChipText = document.getElementById('resolutionChipText');
+        this.segRoiImportInput = document.getElementById('segRoiImportInput') as HTMLInputElement | null;
+        this.segPackageImportInput = document.getElementById('segPackageImportInput') as HTMLInputElement | null;
 
         this.sliceCanvases.xy = document.getElementById('canvasXY') as HTMLCanvasElement;
         this.sliceCanvases.xz = document.getElementById('canvasXZ') as HTMLCanvasElement;
@@ -111,7 +324,7 @@ export class ViewerApp {
         };
 
         const fileInput = document.getElementById('fileInput') as HTMLInputElement;
-        const dropZone = document.getElementById('dropZone') as HTMLElement;
+        const dropZone = this.dropZoneEl;
 
         // Initialize WebGPU
         try {
@@ -142,7 +355,11 @@ export class ViewerApp {
         this.init3DControls();
         this.initSidebarControls();
         this.initHistogramHandles();
+        this.bindOverlayUI();
         this.initResizeObservers();
+        this.updateToolModePanel();
+        this.updateToolModePanelSide();
+        window.addEventListener('beforeunload', () => this.segmentationWorker.dispose());
     }
 
     // ================================================================
@@ -157,7 +374,14 @@ export class ViewerApp {
         for (const axis of AXES) {
             this.renderSlice(axis);
         }
-        this.mipRenderer?.render();
+        if (this.mipRenderer) {
+            this.apply3DOverlaySettings();
+            const seg = this.uiState.state.segmentation;
+            if ((this.mask3DDirty || this.mask3DPaletteDirty) && this.isSegmentationMode() && seg.visible) {
+                this.schedule3DMaskSync({ render: false });
+            }
+            this.mipRenderer.render();
+        }
     }
 
     private renderSlices(): void {
@@ -174,7 +398,22 @@ export class ViewerApp {
 
         const index = this.uiState.state.slices[axis];
         const slice = volume.getSlice(axis, index);
-        renderer.updateSlice(slice);
+        const seg = this.uiState.state.segmentation;
+        renderer.maskOverlayEnabled = !!this.maskVolume && seg.visible && this.isSegmentationMode();
+        renderer.maskOverlayOpacity = seg.overlayOpacity;
+        renderer.maskOverlayColor = seg.color;
+        if (this.isSegmentationMode()) {
+            renderer.setMaskPalette(this.buildMaskPalette());
+        }
+
+        let maskSliceData: MaskTypedArray | null = null;
+        if (this.maskVolume && this.isSegmentationMode()) {
+            const maskSlice = this.maskVolume.getSlice(axis, index, this.maskSliceBuffers[axis] ?? undefined);
+            this.maskSliceBuffers[axis] = maskSlice.data;
+            maskSliceData = this.filterMaskSliceForDisplay(axis, maskSlice.data);
+        }
+
+        renderer.updateSlice(slice, maskSliceData);
         renderer.render();
 
         // Update low-res indicator
@@ -197,6 +436,301 @@ export class ViewerApp {
         volume.prefetch(axis, index);
     }
 
+    private filterMaskSliceForDisplay(axis: ViewAxis, maskSlice: MaskTypedArray): MaskTypedArray {
+        const seg = this.uiState.state.segmentation;
+        const active = this.getActiveRoi();
+        const requiresFilter = seg.showOnlyActive && !!active;
+        if (!requiresFilter) {
+            return maskSlice;
+        }
+
+        const allowedClassId = active.classId;
+
+        const ctor = maskSlice instanceof Uint16Array ? Uint16Array : Uint8Array;
+        let out = this.maskDisplaySliceBuffers[axis];
+        if (!out || out.length !== maskSlice.length || out.constructor !== ctor) {
+            out = new ctor(maskSlice.length) as MaskTypedArray;
+            this.maskDisplaySliceBuffers[axis] = out;
+        }
+
+        for (let i = 0; i < maskSlice.length; i++) {
+            const classId = maskSlice[i];
+            out[i] = classId === allowedClassId ? classId : 0;
+        }
+        return out;
+    }
+
+    private buildMaskPalette(): Float32Array {
+        const seg = this.uiState.state.segmentation;
+        const active = this.getActiveRoi();
+        const [defaultR, defaultG, defaultB] = seg.color;
+        const out = this.maskPaletteData;
+
+        // Default palette: class 0 transparent, unknown classes use fallback color.
+        for (let classId = 0; classId < 256; classId++) {
+            const base = classId * 4;
+            out[base] = defaultR;
+            out[base + 1] = defaultG;
+            out[base + 2] = defaultB;
+            out[base + 3] = classId === 0 ? 0.0 : 1.0;
+        }
+
+        for (const roi of this.roiEntries) {
+            if (roi.classId < 1 || roi.classId > 255) continue;
+            const base = roi.classId * 4;
+            const [r, g, b] = hexToRgb01(roi.colorHex);
+            out[base] = r;
+            out[base + 1] = g;
+            out[base + 2] = b;
+            let alpha = roi.visible ? 1.0 : 0.0;
+            if (seg.showOnlyActive && active && roi.id !== active.id) {
+                alpha = 0.0;
+            }
+            out[base + 3] = alpha;
+        }
+
+        return out;
+    }
+
+    private mark3DMaskDirty(): void {
+        this.mask3DDirty = true;
+    }
+
+    private mark3DPaletteDirty(): void {
+        this.mask3DPaletteDirty = true;
+    }
+
+    private clear3DMaskSyncTimer(): void {
+        if (this.mask3DSyncTimer != null) {
+            clearTimeout(this.mask3DSyncTimer);
+            this.mask3DSyncTimer = null;
+        }
+    }
+
+    private apply3DOverlaySettings(): void {
+        if (!this.mipRenderer) return;
+        const seg = this.uiState.state.segmentation;
+        const enabled = !!this.maskVolume && this.isSegmentationMode() && seg.visible;
+        this.mipRenderer.setMaskOverlay(enabled, seg.overlayOpacity);
+    }
+
+    private getMask3DLookup(
+        srcDims: [number, number, number],
+        dstDims: [number, number, number],
+    ): Mask3DLookupCache {
+        const cache = this.mask3DLookupCache;
+        if (cache
+            && cache.srcDims[0] === srcDims[0] && cache.srcDims[1] === srcDims[1] && cache.srcDims[2] === srcDims[2]
+            && cache.dstDims[0] === dstDims[0] && cache.dstDims[1] === dstDims[1] && cache.dstDims[2] === dstDims[2]) {
+            return cache;
+        }
+
+        const [sx, sy, sz] = srcDims;
+        const [dx, dy, dz] = dstDims;
+        const buildAxisRanges = (srcSize: number, dstSize: number): { start: Int32Array; end: Int32Array } => {
+            const start = new Int32Array(dstSize);
+            const end = new Int32Array(dstSize);
+            for (let i = 0; i < dstSize; i++) {
+                let from = Math.floor((i * srcSize) / dstSize);
+                let to = Math.floor(((i + 1) * srcSize) / dstSize);
+                from = Math.max(0, Math.min(srcSize - 1, from));
+                to = Math.max(from + 1, Math.min(srcSize, to));
+                start[i] = from;
+                end[i] = to;
+            }
+            return { start, end };
+        };
+
+        const x = buildAxisRanges(sx, dx);
+        const y = buildAxisRanges(sy, dy);
+        const z = buildAxisRanges(sz, dz);
+
+        const next: Mask3DLookupCache = {
+            srcDims,
+            dstDims,
+            xStart: x.start,
+            xEnd: x.end,
+            yStart: y.start,
+            yEnd: y.end,
+            zStart: z.start,
+            zEnd: z.end,
+            conservative: dx < sx || dy < sy || dz < sz,
+        };
+        this.mask3DLookupCache = next;
+        return next;
+    }
+
+    private buildMask3DUploadData(targetDims: [number, number, number]): Uint8Array | null {
+        const mask = this.maskVolume;
+        if (!mask) return null;
+        const [dx, dy, dz] = targetDims;
+        if (dx <= 0 || dy <= 0 || dz <= 0) return null;
+
+        const count = dx * dy * dz;
+        let out = this.mask3DLabelBuffer;
+        if (!out || out.length !== count) {
+            out = new Uint8Array(count);
+            this.mask3DLabelBuffer = out;
+        }
+
+        const lookup = this.getMask3DLookup(mask.dimensions, targetDims);
+        const classCounts = new Uint16Array(256);
+        const touchedClasses = new Uint8Array(256);
+        let touchedCount = 0;
+
+        let write = 0;
+        for (let z = 0; z < dz; z++) {
+            const zStart = lookup.zStart[z];
+            const zEnd = lookup.zEnd[z];
+            for (let y = 0; y < dy; y++) {
+                const yStart = lookup.yStart[y];
+                const yEnd = lookup.yEnd[y];
+                for (let x = 0; x < dx; x++, write++) {
+                    const xStart = lookup.xStart[x];
+                    const xEnd = lookup.xEnd[x];
+
+                    let bestClass = 0;
+                    let bestCount = 0;
+
+                    if (lookup.conservative) {
+                        for (let sz = zStart; sz < zEnd; sz++) {
+                            for (let sy = yStart; sy < yEnd; sy++) {
+                                for (let sx = xStart; sx < xEnd; sx++) {
+                                    const classId = mask.getVoxel(sx, sy, sz);
+                                    if (classId <= 0) continue;
+                                    const clippedClass = classId > 255 ? 255 : classId;
+                                    if (classCounts[clippedClass] === 0) {
+                                        touchedClasses[touchedCount++] = clippedClass;
+                                    }
+                                    const nextCount = classCounts[clippedClass] + 1;
+                                    classCounts[clippedClass] = nextCount;
+                                    if (nextCount > bestCount) {
+                                        bestCount = nextCount;
+                                        bestClass = clippedClass;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        const sampleX = xStart;
+                        const sampleY = yStart;
+                        const sampleZ = zStart;
+                        const classId = mask.getVoxel(sampleX, sampleY, sampleZ);
+                        bestClass = classId > 255 ? 255 : classId;
+                    }
+
+                    out[write] = bestClass;
+                    for (let i = 0; i < touchedCount; i++) {
+                        classCounts[touchedClasses[i]] = 0;
+                    }
+                    touchedCount = 0;
+                }
+            }
+        }
+        return out;
+    }
+
+    private schedule3DMaskSync(options: { immediate?: boolean; render?: boolean } = {}): void {
+        if (!this.mipRenderer) return;
+        const immediate = options.immediate === true;
+        const wantsRender = options.render !== false;
+        this.mask3DSyncWantsRender = this.mask3DSyncWantsRender || wantsRender;
+
+        if (immediate) {
+            this.clear3DMaskSyncTimer();
+            const render = this.mask3DSyncWantsRender;
+            this.mask3DSyncWantsRender = false;
+            this.sync3DMaskOverlayNow(render);
+            return;
+        }
+
+        if (this.mask3DSyncTimer != null) {
+            return;
+        }
+
+        const now = performance.now();
+        const minInterval = this.segmentationDragging ? MASK_3D_SYNC_DRAG_MS : MASK_3D_SYNC_IDLE_MS;
+        const delay = Math.max(0, minInterval - (now - this.mask3DLastSyncAt));
+        this.mask3DSyncTimer = window.setTimeout(() => {
+            this.mask3DSyncTimer = null;
+            const render = this.mask3DSyncWantsRender;
+            this.mask3DSyncWantsRender = false;
+            this.sync3DMaskOverlayNow(render);
+        }, delay);
+    }
+
+    private sync3DMaskOverlayNow(render: boolean): void {
+        const mip = this.mipRenderer;
+        if (!mip) return;
+        this.mask3DLastSyncAt = performance.now();
+        this.apply3DOverlaySettings();
+
+        if (this.mask3DPaletteDirty) {
+            mip.setMaskPalette(this.buildMaskPalette());
+            this.mask3DPaletteDirty = false;
+        }
+
+        const targetDims = mip.getVolumeDimensions();
+        if (!targetDims) {
+            if (render) mip.render();
+            return;
+        }
+
+        if (!this.maskVolume) {
+            if (this.mask3DDirty) {
+                mip.clearLabelVolume();
+                this.mask3DDirty = false;
+            }
+            if (render) mip.render();
+            return;
+        }
+
+        const seg = this.uiState.state.segmentation;
+        const overlayEnabled = this.isSegmentationMode() && seg.visible;
+        if (overlayEnabled && this.mask3DDirty) {
+            const labels = this.buildMask3DUploadData(targetDims);
+            if (labels) {
+                mip.uploadLabelVolume(labels, targetDims);
+            } else {
+                mip.clearLabelVolume();
+            }
+            this.mask3DDirty = false;
+        }
+
+        if (render) {
+            mip.render();
+        }
+    }
+
+    private updateToolModePanel(): void {
+        if (!this.toolModePanel) return;
+        const mode = this.uiState.state.appMode;
+        const hasVolume = !!this.volume;
+        this.toolModePanel.classList.toggle('open', hasVolume);
+        this.toolModePanel.setAttribute('aria-hidden', hasVolume ? 'false' : 'true');
+        if (this.toolModeViewing) {
+            this.toolModeViewing.classList.toggle('active', mode === AppMode.Viewing);
+        }
+        if (this.toolModeMeasuring) {
+            this.toolModeMeasuring.classList.toggle('active', mode === AppMode.Measuring);
+        }
+        if (this.toolModeSegmentation) {
+            this.toolModeSegmentation.classList.toggle('active', mode === AppMode.Segmentation);
+        }
+    }
+
+    private updateToolModePanelSide(): void {
+        if (!this.toolDock || !this.toolModePanel) return;
+        const containerRect = this.dropZoneEl.getBoundingClientRect();
+        const dockRect = this.toolDock.getBoundingClientRect();
+        const panelWidth = Math.max(220, this.toolModePanel.getBoundingClientRect().width || 268);
+        const leftInContainer = dockRect.left - containerRect.left;
+        const rightSpace = containerRect.width - (leftInContainer + dockRect.width) - 8;
+        const leftSpace = leftInContainer - 8;
+        const placeLeft = rightSpace < panelWidth && leftSpace > rightSpace;
+        this.toolDock.classList.toggle('tool-dock-right', placeLeft);
+    }
+
     private scheduleRender(): void {
         if (this.renderPending) return;
         this.renderPending = true;
@@ -215,13 +749,982 @@ export class ViewerApp {
         });
     }
 
+    private scheduleAxisRender(axis: ViewAxis): void {
+        this.pendingAxisRenders.add(axis);
+        if (this.axisRenderPending) return;
+        this.axisRenderPending = true;
+        requestAnimationFrame(() => {
+            this.axisRenderPending = false;
+            const axes = Array.from(this.pendingAxisRenders);
+            this.pendingAxisRenders.clear();
+            for (const a of axes) {
+                this.renderSlice(a);
+            }
+        });
+    }
+
+    // ================================================================
+    // App mode + segmentation state
+    // ================================================================
+
+    private isSegmentationMode(): boolean {
+        return this.uiState.state.appMode === AppMode.Segmentation;
+    }
+
+    private isMeasuringMode(): boolean {
+        return this.uiState.state.appMode === AppMode.Measuring;
+    }
+
+    private findRoiById(id: string | null): ROIEntry | null {
+        return this.roiRegistry.findById(id);
+    }
+
+    private getActiveRoi(): ROIEntry | null {
+        return this.findRoiById(this.uiState.state.segmentation.activeROIId);
+    }
+
+    private resetRoiEntries(): void {
+        if (this.statsRefreshTimer != null) {
+            clearTimeout(this.statsRefreshTimer);
+            this.statsRefreshTimer = null;
+        }
+        this.statsRefreshQueued = false;
+        this.lastStatsRefreshAt = 0;
+        this.invalidateActiveRoiStats();
+        this.roiRegistry.reset();
+        if (this.segRoiList) {
+            this.segRoiList.innerHTML = '';
+        }
+        this.updateActiveRoiStatsDisplay(null);
+        this.mark3DPaletteDirty();
+        this.schedule3DMaskSync({ render: false });
+    }
+
+    private addRoiEntry(makeActive = true): ROIEntry | null {
+        const roi = this.roiRegistry.add(255);
+        if (!roi) {
+            console.warn('ROI limit reached: uint8 labelmap supports up to 255 classes.');
+            return null;
+        }
+
+        if (makeActive) {
+            this.setActiveRoi(roi.id);
+        } else {
+            this.refreshSegmentationOverlayUI();
+        }
+        this.mark3DPaletteDirty();
+        this.schedule3DMaskSync({ render: true });
+        return roi;
+    }
+
+    private ensureActiveRoiExists(): void {
+        if (this.roiEntries.length === 0) {
+            this.addRoiEntry(true);
+            return;
+        }
+        const active = this.getActiveRoi();
+        if (!active) {
+            this.setActiveRoi(this.roiEntries[0].id);
+        }
+    }
+
+    private setActiveRoi(roiId: string): void {
+        const roi = this.findRoiById(roiId);
+        if (!roi) return;
+        this.invalidateActiveRoiStats();
+        this.setSegmentationState({
+            activeROIId: roi.id,
+            activeClassId: roi.classId,
+            color: hexToRgb01(roi.colorHex),
+        });
+        this.scheduleActiveRoiStatsRefresh({ force: true });
+    }
+
+    private formatNumeric(value: number, digits = 2): string {
+        if (!Number.isFinite(value)) return '-';
+        return value.toLocaleString(undefined, {
+            minimumFractionDigits: 0,
+            maximumFractionDigits: digits,
+        });
+    }
+
+    private rgb01ToHex(color: [number, number, number]): string {
+        const toHex = (v: number) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
+        return `#${toHex(color[0])}${toHex(color[1])}${toHex(color[2])}`;
+    }
+
+    private cancelActiveRoiStatsRebuild(): void {
+        this.activeRoiStatsRebuildToken++;
+        this.activeRoiStatsRebuilding = false;
+        if (this.activeRoiStatsRebuildTimer != null) {
+            clearTimeout(this.activeRoiStatsRebuildTimer);
+            this.activeRoiStatsRebuildTimer = null;
+        }
+    }
+
+    private invalidateActiveRoiStats(): void {
+        this.cancelActiveRoiStatsRebuild();
+        this.activeRoiStats = null;
+        this.activeRoiStatsDirty = true;
+    }
+
+    private startActiveRoiStatsRebuild(active: ROIEntry): void {
+        const mask = this.maskVolume;
+        const volume = this.volume;
+        if (!mask || !volume) {
+            this.invalidateActiveRoiStats();
+            this.updateActiveRoiStatsDisplay(null);
+            return;
+        }
+
+        this.cancelActiveRoiStatsRebuild();
+        const token = ++this.activeRoiStatsRebuildToken;
+        this.activeRoiStatsRebuilding = true;
+
+        const [nx, ny, nz] = mask.dimensions;
+        const voxelsPerSlice = Math.max(1, nx * ny);
+        const slicesPerChunk = Math.max(1, Math.floor(ACTIVE_ROI_STATS_CHUNK_TARGET_VOXELS / voxelsPerSlice));
+        const acc: ActiveRoiStatsAccumulator = {
+            roiId: active.id,
+            classId: active.classId,
+            voxels: 0,
+            sampleCount: 0,
+            sum: 0,
+            sumSq: 0,
+        };
+        let zCursor = 0;
+
+        const processChunk = () => {
+            if (token !== this.activeRoiStatsRebuildToken) return;
+
+            const endZ = Math.min(nz, zCursor + slicesPerChunk);
+            for (let z = zCursor; z < endZ; z++) {
+                for (let y = 0; y < ny; y++) {
+                    for (let x = 0; x < nx; x++) {
+                        if (mask.getVoxel(x, y, z) !== acc.classId) continue;
+                        acc.voxels++;
+                        const value = volume.getValue(x, y, z);
+                        if (value == null) continue;
+                        acc.sampleCount++;
+                        acc.sum += value;
+                        acc.sumSq += value * value;
+                    }
+                }
+            }
+            zCursor = endZ;
+            this.applyActiveRoiStatsDisplay(acc);
+
+            if (zCursor < nz) {
+                this.activeRoiStatsRebuildTimer = window.setTimeout(processChunk, 0);
+                return;
+            }
+
+            if (token !== this.activeRoiStatsRebuildToken) return;
+            this.activeRoiStatsRebuildTimer = null;
+            this.activeRoiStatsRebuilding = false;
+            this.activeRoiStats = acc;
+            this.activeRoiStatsDirty = false;
+            this.applyActiveRoiStatsDisplay(acc);
+        };
+
+        processChunk();
+    }
+
+    private applyActiveRoiStatsDisplay(acc: ActiveRoiStatsAccumulator | null): void {
+        if (!acc || !this.volume) {
+            this.updateActiveRoiStatsDisplay(null);
+            return;
+        }
+        const mean = acc.sampleCount > 0 ? acc.sum / acc.sampleCount : 0;
+        const variance = acc.sampleCount > 0 ? Math.max(0, acc.sumSq / acc.sampleCount - mean * mean) : 0;
+        const voxelVolume = this.volume.spacing[0] * this.volume.spacing[1] * this.volume.spacing[2];
+        this.updateActiveRoiStatsDisplay({
+            voxels: acc.voxels,
+            volume: acc.voxels * voxelVolume,
+            mean,
+            std: Math.sqrt(variance),
+        });
+    }
+
+    private applyVoxelChangeToActiveRoiStats(
+        x: number,
+        y: number,
+        z: number,
+        previousClassId: number,
+        nextClassId: number,
+    ): void {
+        if (previousClassId === nextClassId) return;
+        if (!this.volume || this.activeRoiStatsDirty || !this.activeRoiStats) return;
+        const active = this.getActiveRoi();
+        if (!active) {
+            this.invalidateActiveRoiStats();
+            return;
+        }
+        if (this.activeRoiStats.roiId !== active.id || this.activeRoiStats.classId !== active.classId) {
+            this.invalidateActiveRoiStats();
+            return;
+        }
+        if (previousClassId !== active.classId && nextClassId !== active.classId) return;
+
+        const value = this.volume.getValue(x, y, z);
+        if (previousClassId === active.classId) {
+            this.activeRoiStats.voxels = Math.max(0, this.activeRoiStats.voxels - 1);
+            if (value != null) {
+                this.activeRoiStats.sampleCount = Math.max(0, this.activeRoiStats.sampleCount - 1);
+                this.activeRoiStats.sum -= value;
+                this.activeRoiStats.sumSq -= value * value;
+            }
+        }
+        if (nextClassId === active.classId) {
+            this.activeRoiStats.voxels += 1;
+            if (value != null) {
+                this.activeRoiStats.sampleCount += 1;
+                this.activeRoiStats.sum += value;
+                this.activeRoiStats.sumSq += value * value;
+            }
+        }
+    }
+
+    private updateActiveRoiStatsDisplay(stats: { voxels: number; volume: number; mean: number; std: number } | null): void {
+        const voxelsEl = document.getElementById('segStatsVoxels');
+        const volumeEl = document.getElementById('segStatsVolume');
+        const meanEl = document.getElementById('segStatsMean');
+        const stdEl = document.getElementById('segStatsStd');
+        if (!voxelsEl || !volumeEl || !meanEl || !stdEl) return;
+
+        if (!stats) {
+            voxelsEl.textContent = '-';
+            volumeEl.textContent = '-';
+            meanEl.textContent = '-';
+            stdEl.textContent = '-';
+            return;
+        }
+
+        voxelsEl.textContent = this.formatNumeric(stats.voxels, 0);
+        volumeEl.textContent = `${this.formatNumeric(stats.volume, 3)} mm3`;
+        meanEl.textContent = this.formatNumeric(stats.mean, 2);
+        stdEl.textContent = this.formatNumeric(stats.std, 2);
+    }
+
+    private refreshActiveRoiStatsNow(): void {
+        const active = this.getActiveRoi();
+        if (!active || !this.maskVolume || !this.volume) {
+            this.invalidateActiveRoiStats();
+            this.updateActiveRoiStatsDisplay(null);
+            return;
+        }
+
+        if (!this.activeRoiStatsDirty
+            && this.activeRoiStats
+            && this.activeRoiStats.roiId === active.id
+            && this.activeRoiStats.classId === active.classId) {
+            this.applyActiveRoiStatsDisplay(this.activeRoiStats);
+            return;
+        }
+
+        if (this.activeRoiStatsRebuilding) {
+            return;
+        }
+
+        this.startActiveRoiStatsRebuild(active);
+    }
+
+    private scheduleActiveRoiStatsRefresh(options: { force?: boolean } = {}): void {
+        const force = options.force === true;
+
+        if (this.segmentationDragging && !force) {
+            this.statsRefreshQueued = true;
+            return;
+        }
+        this.statsRefreshQueued = false;
+
+        if (this.statsRefreshTimer != null) {
+            if (!force) {
+                return;
+            }
+            clearTimeout(this.statsRefreshTimer);
+            this.statsRefreshTimer = null;
+        }
+
+        const elapsed = performance.now() - this.lastStatsRefreshAt;
+        const delay = force ? 0 : Math.max(0, ACTIVE_ROI_STATS_DEBOUNCE_MS - elapsed);
+        this.statsRefreshTimer = window.setTimeout(() => {
+            this.statsRefreshTimer = null;
+            this.lastStatsRefreshAt = performance.now();
+            this.refreshActiveRoiStatsNow();
+            if (this.statsRefreshQueued && !this.segmentationDragging) {
+                this.scheduleActiveRoiStatsRefresh();
+            }
+        }, delay);
+    }
+
+    private refreshSegmentationOverlayUI(): void {
+        const seg = this.uiState.state.segmentation;
+        const segEnableToggle = document.getElementById('segEnableToggle') as HTMLInputElement | null;
+        const segVisibleToggle = document.getElementById('segVisibleToggle') as HTMLInputElement | null;
+        const showOnlyActiveToggle = document.getElementById('segShowOnlyActiveToggle') as HTMLInputElement | null;
+        const opacitySlider = document.getElementById('segOpacitySlider') as HTMLInputElement | null;
+        const opacityValue = document.getElementById('segOpacityValue');
+        const segBrushSize = document.getElementById('segBrushSize') as HTMLInputElement | null;
+        const segBrushSizeValue = document.getElementById('segBrushSizeValue');
+        const segThresholdMin = document.getElementById('segThresholdMin') as HTMLInputElement | null;
+        const segThresholdMax = document.getElementById('segThresholdMax') as HTMLInputElement | null;
+        const segGrowTolerance = document.getElementById('segGrowTolerance') as HTMLInputElement | null;
+        const segGrowRadius = document.getElementById('segGrowRadius') as HTMLInputElement | null;
+        const duplicateBtn = document.getElementById('segDuplicateRoiBtn') as HTMLButtonElement | null;
+        const mergeBtn = document.getElementById('segMergeRoiBtn') as HTMLButtonElement | null;
+        const exportBtn = document.getElementById('segExportRoiBtn') as HTMLButtonElement | null;
+        const importBtn = document.getElementById('segImportRoiBtn') as HTMLButtonElement | null;
+        const exportSegBtn = document.getElementById('segExportSegBtn') as HTMLButtonElement | null;
+        const importSegBtn = document.getElementById('segImportSegBtn') as HTMLButtonElement | null;
+        const active = this.getActiveRoi();
+
+        if (segEnableToggle) segEnableToggle.checked = seg.enabled;
+        if (segVisibleToggle) segVisibleToggle.checked = seg.visible;
+        if (showOnlyActiveToggle) showOnlyActiveToggle.checked = seg.showOnlyActive;
+        if (opacitySlider) opacitySlider.value = seg.overlayOpacity.toFixed(2);
+        if (opacityValue) opacityValue.textContent = seg.overlayOpacity.toFixed(2);
+        if (segBrushSize) segBrushSize.value = String(seg.brushRadius);
+        if (segBrushSizeValue) segBrushSizeValue.textContent = String(seg.brushRadius);
+        if (segThresholdMin) segThresholdMin.value = String(Math.round(seg.thresholdMin));
+        if (segThresholdMax) segThresholdMax.value = String(Math.round(seg.thresholdMax));
+        if (segGrowTolerance) segGrowTolerance.value = String(Math.round(seg.regionGrowTolerance));
+        if (segGrowRadius) segGrowRadius.value = String(seg.regionGrowSliceRadius);
+        if (this.segmentationPinBtn) {
+            this.segmentationPinBtn.classList.toggle('active', seg.isPinned);
+        }
+        this.updateSegmentationToolRows(seg.tool);
+        this.updateSegmentationToolButtons(seg.tool);
+        this.updateSegmentationBrushButtons(seg.paintValue);
+        if (duplicateBtn) duplicateBtn.disabled = !active;
+        if (mergeBtn) mergeBtn.disabled = !active || this.roiEntries.length < 2;
+        if (exportBtn) exportBtn.disabled = !active;
+        if (importBtn) importBtn.disabled = !this.volume;
+        if (exportSegBtn) exportSegBtn.disabled = !this.volume || !this.maskVolume;
+        if (importSegBtn) importSegBtn.disabled = !this.volume;
+
+        this.renderRoiList();
+    }
+
+    private renderRoiList(): void {
+        if (!this.segRoiList) return;
+        this.segRoiList.innerHTML = '';
+        const activeId = this.uiState.state.segmentation.activeROIId;
+
+        if (this.roiEntries.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'seg-roi-empty';
+            empty.textContent = 'No ROIs yet';
+            this.segRoiList.appendChild(empty);
+            return;
+        }
+
+        for (const roi of this.roiEntries) {
+            const row = document.createElement('div');
+            row.className = 'seg-roi-row';
+            if (roi.id === activeId) row.classList.add('active');
+            if (roi.aiBusy) row.classList.add('busy');
+            row.title = `Class ${roi.classId}`;
+            row.addEventListener('click', () => this.setActiveRoi(roi.id));
+
+            const colorInput = document.createElement('input');
+            colorInput.type = 'color';
+            colorInput.className = 'seg-roi-color';
+            colorInput.value = roi.colorHex;
+            colorInput.addEventListener('click', (e) => e.stopPropagation());
+            colorInput.addEventListener('input', () => {
+                roi.colorHex = colorInput.value;
+                if (this.uiState.state.segmentation.activeROIId === roi.id) {
+                    this.setSegmentationState({ color: hexToRgb01(roi.colorHex) });
+                } else {
+                    this.refreshSegmentationOverlayUI();
+                }
+                this.scheduleSliceRender();
+                this.mark3DPaletteDirty();
+                this.schedule3DMaskSync({ render: true });
+            });
+
+            const nameInput = document.createElement('input');
+            nameInput.type = 'text';
+            nameInput.className = 'seg-roi-name';
+            nameInput.value = roi.name;
+            nameInput.addEventListener('click', (e) => e.stopPropagation());
+            nameInput.addEventListener('change', () => {
+                const trimmed = nameInput.value.trim();
+                roi.name = trimmed || `ROI ${roi.classId}`;
+                nameInput.value = roi.name;
+            });
+
+            const visibilityBtn = document.createElement('button');
+            visibilityBtn.type = 'button';
+            visibilityBtn.className = `seg-roi-btn${roi.visible ? '' : ' off'}`;
+            visibilityBtn.textContent = roi.visible ? 'Vis' : 'Hide';
+            visibilityBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                roi.visible = !roi.visible;
+                this.refreshSegmentationOverlayUI();
+                this.scheduleSliceRender();
+                this.mark3DPaletteDirty();
+                this.schedule3DMaskSync({ render: true });
+            });
+
+            const lockBtn = document.createElement('button');
+            lockBtn.type = 'button';
+            lockBtn.className = `seg-roi-btn${roi.locked ? ' locked' : ''}`;
+            lockBtn.textContent = roi.locked ? 'Lock' : 'Edit';
+            lockBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                roi.locked = !roi.locked;
+                this.refreshSegmentationOverlayUI();
+            });
+
+            const busyTag = document.createElement('span');
+            busyTag.className = 'seg-roi-busy';
+            busyTag.textContent = roi.aiBusy ? '...' : '';
+            row.append(colorInput, nameInput, visibilityBtn, lockBtn, busyTag);
+            this.segRoiList.appendChild(row);
+        }
+    }
+
+    private duplicateActiveRoi(): void {
+        const active = this.getActiveRoi();
+        if (!active || !this.maskVolume) return;
+        const duplicate = this.addRoiEntry(false);
+        if (!duplicate) return;
+        this.invalidateActiveRoiStats();
+        const changed = this.segmentationStore.remapClass(active.classId, duplicate.classId);
+        this.segmentationStore.clearOps();
+
+        this.setActiveRoi(duplicate.id);
+        this.scheduleSliceRender();
+        if (changed > 0) {
+            this.mark3DMaskDirty();
+            this.schedule3DMaskSync({ immediate: true, render: true });
+        }
+    }
+
+    private mergeRoiIntoActive(): void {
+        const active = this.getActiveRoi();
+        if (!active || !this.maskVolume) return;
+        const mergeCandidates = this.roiEntries.filter((roi) => roi.id !== active.id);
+        if (mergeCandidates.length === 0) return;
+
+        const options = mergeCandidates.map((roi) => `${roi.classId}:${roi.name}`).join(', ');
+        const requested = window.prompt(`Merge class into "${active.name}" (${options})`, `${mergeCandidates[0].classId}`);
+        if (requested == null) return;
+        const classId = parseInt(requested, 10);
+        const source = mergeCandidates.find((roi) => roi.classId === classId);
+        if (!source) return;
+        this.invalidateActiveRoiStats();
+        const changed = this.segmentationStore.remapClass(source.classId, active.classId);
+        this.segmentationStore.clearOps();
+
+        this.roiRegistry.removeById(source.id);
+        this.refreshSegmentationOverlayUI();
+        this.scheduleSliceRender();
+        this.scheduleActiveRoiStatsRefresh({ force: true });
+        this.mark3DPaletteDirty();
+        if (changed > 0) {
+            this.mark3DMaskDirty();
+        }
+        this.schedule3DMaskSync({ immediate: true, render: true });
+    }
+
+    private sanitizeFileStem(value: string, fallback: string): string {
+        const normalized = value.trim().replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '');
+        return normalized || fallback;
+    }
+
+    private downloadJson(payload: unknown, stem: string): void {
+        const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = `${stem}.json`;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+
+    private normalizeHexColor(value: unknown): string | null {
+        if (typeof value !== 'string') return null;
+        const trimmed = value.trim();
+        const match = /^#?([0-9a-fA-F]{6})$/.exec(trimmed);
+        if (!match) return null;
+        return `#${match[1].toLowerCase()}`;
+    }
+
+    private isRoiMaskPayload(value: unknown): value is RoiMaskPayload {
+        if (!value || typeof value !== 'object') return false;
+        const payload = value as Partial<RoiMaskPayload>;
+        const dims = payload.dimensions;
+        const spacing = payload.spacing;
+        const mask = payload.mask as Partial<BinaryMaskRLEJson> | undefined;
+        return payload.format === 'viewer-roi-mask-v1'
+            && typeof payload.name === 'string'
+            && Array.isArray(dims) && dims.length === 3
+            && Array.isArray(spacing) && spacing.length === 3
+            && !!mask
+            && mask.encoding === 'binary-rle-v1'
+            && typeof mask.totalVoxels === 'number'
+            && typeof mask.oneCount === 'number'
+            && (mask.startsWith === 0 || mask.startsWith === 1)
+            && Array.isArray(mask.runs);
+    }
+
+    private isSegmentationPackagePayload(value: unknown): value is SegmentationPackagePayload {
+        if (!value || typeof value !== 'object') return false;
+        const payload = value as Partial<SegmentationPackagePayload>;
+        return payload.format === 'viewer-segmentation-package-v1'
+            && Array.isArray(payload.dimensions) && payload.dimensions.length === 3
+            && Array.isArray(payload.spacing) && payload.spacing.length === 3
+            && (payload.classDataType === 'uint8' || payload.classDataType === 'uint16')
+            && typeof payload.chunkSize === 'number'
+            && Array.isArray(payload.tiles)
+            && Array.isArray(payload.rois);
+    }
+
+    private async exportActiveRoi(): Promise<void> {
+        const active = this.getActiveRoi();
+        if (!active || !this.maskVolume || !this.volume) return;
+
+        const bits = this.segmentationStore.buildClassMaskBits(active.classId);
+        if (!bits) return;
+
+        this.setActiveRoiBusy(active.id, true);
+        try {
+            const encodedMask = await this.segmentationWorker.encodeBinaryMaskRLE({ bits });
+            const payload: RoiMaskPayload = {
+                format: 'viewer-roi-mask-v1',
+                name: active.name,
+                colorHex: active.colorHex,
+                classId: active.classId,
+                dimensions: this.maskVolume.dimensions,
+                spacing: this.volume.spacing,
+                voxelCount: encodedMask.oneCount,
+                mask: {
+                    encoding: 'binary-rle-v1',
+                    totalVoxels: encodedMask.totalVoxels,
+                    oneCount: encodedMask.oneCount,
+                    startsWith: encodedMask.startsWith,
+                    runs: Array.from(encodedMask.runs),
+                },
+            };
+            this.downloadJson(payload, this.sanitizeFileStem(active.name, `roi_${active.classId}`));
+        } catch (error) {
+            console.error('Failed to export ROI:', error);
+            window.alert('Failed to export ROI mask.');
+        } finally {
+            this.setActiveRoiBusy(active.id, false);
+        }
+    }
+
+    private async importRoiFromFile(file: File): Promise<void> {
+        if (!this.volume) {
+            window.alert('Load a volume before importing ROI masks.');
+            return;
+        }
+        this.ensureMaskVolumeForCurrentVolume();
+        if (!this.maskVolume) return;
+
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(await file.text());
+        } catch (error) {
+            console.error('Failed parsing ROI JSON:', error);
+            window.alert('Selected file is not valid JSON.');
+            return;
+        }
+        if (!this.isRoiMaskPayload(parsed)) {
+            window.alert('Unsupported ROI file format.');
+            return;
+        }
+        const payload = parsed;
+        const [nx, ny, nz] = this.maskVolume.dimensions;
+        const [px, py, pz] = payload.dimensions;
+        if (nx !== px || ny !== py || nz !== pz) {
+            window.alert(`ROI dimensions do not match current volume (${nx}x${ny}x${nz}).`);
+            return;
+        }
+
+        const roi = this.addRoiEntry(false);
+        if (!roi) {
+            window.alert('Unable to create ROI. Label class limit may be reached.');
+            return;
+        }
+        roi.name = payload.name.trim() || roi.name;
+        const normalizedColor = this.normalizeHexColor(payload.colorHex);
+        if (normalizedColor) {
+            roi.colorHex = normalizedColor;
+        }
+        this.setActiveRoiBusy(roi.id, true);
+
+        try {
+            const runs = Uint32Array.from(payload.mask.runs.map((n) => Math.max(0, Math.floor(n))));
+            const decoded = await this.segmentationWorker.decodeBinaryMaskRLE({
+                totalVoxels: payload.mask.totalVoxels,
+                startsWith: payload.mask.startsWith,
+                runs,
+            });
+            const changed = this.segmentationStore.applyBinaryMaskBitsToClass(roi.classId, decoded.bits);
+            this.segmentationStore.clearOps();
+            this.setActiveRoi(roi.id);
+            this.invalidateActiveRoiStats();
+            this.scheduleSliceRender();
+            this.scheduleActiveRoiStatsRefresh({ force: true });
+            this.updatePixelInfo();
+            this.refreshSegmentationOverlayUI();
+            if (changed > 0) {
+                this.mark3DMaskDirty();
+            }
+            this.mark3DPaletteDirty();
+            this.schedule3DMaskSync({ immediate: true, render: true });
+        } catch (error) {
+            console.error('Failed to import ROI:', error);
+            this.roiRegistry.removeById(roi.id);
+            this.refreshSegmentationOverlayUI();
+            window.alert('Failed to import ROI mask.');
+        } finally {
+            this.setActiveRoiBusy(roi.id, false);
+        }
+    }
+
+    private exportSegmentationPackage(): void {
+        if (!this.volume || !this.maskVolume) return;
+        const snapshot = this.segmentationStore.serializeLabelTiles(64);
+        if (!snapshot) return;
+
+        const payload: SegmentationPackagePayload = {
+            format: 'viewer-segmentation-package-v1',
+            dimensions: snapshot.dimensions,
+            spacing: this.volume.spacing,
+            classDataType: snapshot.classDataType,
+            chunkSize: snapshot.chunkSize,
+            tiles: snapshot.tiles,
+            rois: this.roiEntries.map((roi) => ({
+                id: roi.id,
+                classId: roi.classId,
+                name: roi.name,
+                colorHex: roi.colorHex,
+                visible: roi.visible,
+                locked: roi.locked,
+            })),
+        };
+        const stem = this.sanitizeFileStem(this.fileNameEl.textContent || 'segmentation', 'segmentation');
+        this.downloadJson(payload, `${stem}_segmentation`);
+    }
+
+    private async importSegmentationPackageFromFile(file: File): Promise<void> {
+        if (!this.volume) {
+            window.alert('Load a volume before importing segmentation packages.');
+            return;
+        }
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(await file.text());
+        } catch (error) {
+            console.error('Failed parsing segmentation package JSON:', error);
+            window.alert('Selected file is not valid JSON.');
+            return;
+        }
+        if (!this.isSegmentationPackagePayload(parsed)) {
+            window.alert('Unsupported segmentation package format.');
+            return;
+        }
+        const payload = parsed;
+        const [vx, vy, vz] = this.volume.dimensions;
+        const [px, py, pz] = payload.dimensions;
+        if (vx !== px || vy !== py || vz !== pz) {
+            window.alert(`Package dimensions do not match current volume (${vx}x${vy}x${vz}).`);
+            return;
+        }
+
+        const recreated = this.segmentationStore.ensureMaskVolume(this.volume.dimensions, {
+            preferredBackend: 'auto',
+            classDataType: payload.classDataType,
+        });
+        if (recreated) {
+            this.maskSliceBuffers = { xy: null, xz: null, yz: null };
+            this.maskDisplaySliceBuffers = { xy: null, xz: null, yz: null };
+            this.mask3DLookupCache = null;
+            this.mask3DLabelBuffer = null;
+            this.invalidateActiveRoiStats();
+        }
+
+        try {
+            const snapshot: SegmentationTilesSnapshot = {
+                format: 'viewer-segmentation-tiles-v1',
+                dimensions: payload.dimensions,
+                classDataType: payload.classDataType,
+                chunkSize: payload.chunkSize,
+                tiles: payload.tiles,
+            };
+            this.segmentationStore.restoreLabelTiles(snapshot, { clearFirst: true });
+        } catch (error) {
+            console.error('Failed restoring segmentation tiles:', error);
+            window.alert('Failed to restore segmentation tiles from file.');
+            return;
+        }
+
+        this.resetRoiEntries();
+        const roiCandidates = payload.rois.filter((roi) =>
+            roi
+            && typeof roi.id === 'string'
+            && typeof roi.classId === 'number'
+            && Number.isFinite(roi.classId)
+            && roi.classId > 0,
+        );
+        const sortedRois = [...roiCandidates].sort((a, b) => a.classId - b.classId);
+        for (const roi of sortedRois) {
+            const color = this.normalizeHexColor(roi.colorHex);
+            this.roiRegistry.addWithClassId(Math.floor(roi.classId), {
+                id: roi.id,
+                name: typeof roi.name === 'string' ? roi.name : undefined,
+                colorHex: color ?? undefined,
+                visible: typeof roi.visible === 'boolean' ? roi.visible : undefined,
+                locked: typeof roi.locked === 'boolean' ? roi.locked : undefined,
+            });
+        }
+        if (this.roiEntries.length === 0) {
+            const usedClassIds = this.segmentationStore.collectUsedClassIds();
+            for (const classId of usedClassIds) {
+                this.roiRegistry.addWithClassId(classId);
+            }
+        }
+
+        if (this.roiEntries.length > 0) {
+            this.setActiveRoi(this.roiEntries[0].id);
+        } else {
+            this.setSegmentationState({
+                activeROIId: null,
+                activeClassId: 1,
+            });
+        }
+        this.scheduleSliceRender();
+        this.scheduleActiveRoiStatsRefresh({ force: true });
+        this.updatePixelInfo();
+        this.refreshSegmentationOverlayUI();
+        this.mark3DMaskDirty();
+        this.mark3DPaletteDirty();
+        this.schedule3DMaskSync({ immediate: true, render: true });
+    }
+
+    private setAppMode(mode: AppMode): void {
+        const current = this.uiState.state.appMode;
+        if (current === mode) return;
+
+        if (current === AppMode.Measuring && mode !== AppMode.Measuring) {
+            this.roiDragging = false;
+            this.removeRoiOverlay();
+        }
+
+        if (current === AppMode.Segmentation && mode !== AppMode.Segmentation) {
+            this.segmentationDragging = false;
+            this.segmentationDragAxis = null;
+            this.activePaintStrokeId = null;
+        }
+
+        this.uiState.update({ appMode: mode });
+
+        if (mode === AppMode.Segmentation) {
+            this.ensureMaskVolumeForCurrentVolume();
+            if (!this.uiState.state.segmentation.enabled) {
+                this.setSegmentationState({ enabled: true });
+            }
+            this.ensureActiveRoiExists();
+        }
+
+        this.syncModeButtons();
+        this.updateSegmentationPanelVisibility();
+        this.updateInteractionCursor();
+        this.scheduleActiveRoiStatsRefresh({ force: true });
+        this.scheduleSliceRender();
+        this.mark3DPaletteDirty();
+        this.schedule3DMaskSync({ immediate: true, render: true });
+    }
+
+    private toggleSegmentationMode(): void {
+        this.setAppMode(this.isSegmentationMode() ? AppMode.Viewing : AppMode.Segmentation);
+    }
+
+    private syncModeButtons(): void {
+        const mode = this.uiState.state.appMode;
+        const roiBtn = document.getElementById('roiBtn');
+        if (roiBtn) {
+            roiBtn.classList.toggle('active', mode === AppMode.Measuring);
+        }
+        if (this.segModeBtn) {
+            this.segModeBtn.classList.toggle('active', mode === AppMode.Segmentation);
+        }
+        this.updateToolModePanel();
+    }
+
+    private updateSegmentationPanelVisibility(): void {
+        const shouldShow = this.shouldKeepSegmentationPanelOpen();
+        if (this.segmentationOverlay) {
+            this.segmentationOverlay.classList.toggle('open', shouldShow);
+            this.segmentationOverlay.setAttribute('aria-hidden', shouldShow ? 'false' : 'true');
+            if (shouldShow) {
+                this.clampSegmentationOverlayPosition();
+            }
+        }
+        this.refreshSegmentationOverlayUI();
+    }
+
+    private shouldKeepSegmentationPanelOpen(): boolean {
+        const seg = this.uiState.state.segmentation;
+        return this.isSegmentationMode() || seg.isPinned;
+    }
+
+    private updateInteractionCursor(): void {
+        const useCrosshair = this.isSegmentationMode() || this.isMeasuringMode();
+        for (const axis of AXES) {
+            const canvas = this.sliceCanvases[axis];
+            if (canvas) {
+                canvas.style.cursor = useCrosshair ? 'crosshair' : '';
+            }
+        }
+    }
+
+    private getActiveSegmentationModeTool(seg: SegmentationSettings): SegmentationSettings['activeTool'] {
+        if (seg.tool === 'brush') {
+            return seg.paintValue === 0 ? 'erase' : 'brush';
+        }
+        if (seg.tool === 'threshold') {
+            return 'threshold';
+        }
+        return 'smart-region';
+    }
+
+    private setSegmentationState(patch: Partial<SegmentationSettings>): void {
+        const next: SegmentationSettings = {
+            ...this.uiState.state.segmentation,
+            ...patch,
+        };
+
+        if (patch.activeTool !== undefined) {
+            switch (patch.activeTool) {
+                case 'erase':
+                    next.tool = 'brush';
+                    next.paintValue = 0;
+                    break;
+                case 'brush':
+                    next.tool = 'brush';
+                    next.paintValue = 1;
+                    break;
+                case 'threshold':
+                    next.tool = 'threshold';
+                    break;
+                case 'smart-region':
+                    next.tool = 'region-grow';
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        if (patch.activeROIId !== undefined) {
+            const roi = this.findRoiById(patch.activeROIId);
+            if (roi) {
+                next.activeROIId = roi.id;
+                next.activeClassId = roi.classId;
+                if (patch.color === undefined) {
+                    next.color = hexToRgb01(roi.colorHex);
+                }
+            } else {
+                next.activeROIId = null;
+            }
+        }
+        if (patch.activeClassId !== undefined && patch.activeROIId === undefined) {
+            const roi = this.roiRegistry.findByClassId(next.activeClassId);
+            if (roi) {
+                next.activeROIId = roi.id;
+                if (patch.color === undefined) {
+                    next.color = hexToRgb01(roi.colorHex);
+                }
+            }
+        }
+
+        if (patch.color !== undefined && next.activeROIId) {
+            const active = this.findRoiById(next.activeROIId);
+            if (active) {
+                active.colorHex = this.rgb01ToHex(patch.color);
+            }
+        }
+
+        next.overlayOpacity = Math.max(0, Math.min(1, next.overlayOpacity));
+        next.brushRadius = Math.max(1, Math.min(64, Math.round(next.brushRadius)));
+        next.activeClassId = Math.max(1, Math.min(255, Math.round(next.activeClassId)));
+        next.regionGrowSliceRadius = Math.max(0, Math.min(MAX_REGION_GROW_SLICE_RADIUS, Math.round(next.regionGrowSliceRadius)));
+        next.activeTool = this.getActiveSegmentationModeTool(next);
+
+        this.uiState.update({ segmentation: next });
+        if (patch.tool !== undefined || patch.activeTool !== undefined) {
+            this.updateSegmentationToolRows(next.tool);
+            this.updateSegmentationToolButtons(next.tool);
+        }
+        if (patch.paintValue !== undefined || patch.activeTool !== undefined) {
+            this.updateSegmentationBrushButtons(next.paintValue);
+        }
+        if (patch.isPinned !== undefined) {
+            this.updateSegmentationPanelVisibility();
+        }
+        if (patch.tool !== undefined || patch.paintValue !== undefined || patch.activeTool !== undefined) {
+            this.updateInteractionCursor();
+        }
+        if (patch.showOnlyActive !== undefined || patch.visible !== undefined || patch.activeROIId !== undefined) {
+            this.scheduleSliceRender();
+        }
+        if (patch.showOnlyActive !== undefined
+            || patch.visible !== undefined
+            || patch.overlayOpacity !== undefined
+            || patch.activeROIId !== undefined
+            || patch.color !== undefined) {
+            this.mark3DPaletteDirty();
+            this.schedule3DMaskSync({ immediate: !this.segmentationDragging, render: true });
+        }
+        this.refreshSegmentationOverlayUI();
+    }
+
     // ================================================================
     // Volume display setup
     // ================================================================
 
+    private ensureMaskVolumeForCurrentVolume(): void {
+        const volume = this.volume;
+        if (!volume) {
+            this.segmentationStore.clearMask();
+            this.maskSliceBuffers = { xy: null, xz: null, yz: null };
+            this.maskDisplaySliceBuffers = { xy: null, xz: null, yz: null };
+            this.mask3DLookupCache = null;
+            this.mask3DLabelBuffer = null;
+            this.invalidateActiveRoiStats();
+            this.mark3DMaskDirty();
+            this.schedule3DMaskSync({ immediate: true, render: true });
+            return;
+        }
+
+        const recreated = this.segmentationStore.ensureMaskVolume(volume.dimensions, {
+            preferredBackend: 'auto',
+            classDataType: 'uint8',
+        });
+        if (recreated) {
+            this.maskSliceBuffers = { xy: null, xz: null, yz: null };
+            this.maskDisplaySliceBuffers = { xy: null, xz: null, yz: null };
+            this.mask3DLookupCache = null;
+            this.mask3DLabelBuffer = null;
+            this.invalidateActiveRoiStats();
+            this.mark3DMaskDirty();
+            this.schedule3DMaskSync({ render: false });
+        }
+    }
+
     private displayVolume(): void {
         const volume = this.volume;
         if (!volume) return;
+
+        this.ensureMaskVolumeForCurrentVolume();
 
         const [nx, ny, nz] = volume.dimensions;
 
@@ -248,35 +1751,66 @@ export class ViewerApp {
         };
 
         // Upload volume to 3D renderer
-        // Streaming volumes: upload the 4x downsampled MIP volume (→ "low")
-        // Standard volumes: upload full if dimensions fit 3D texture limit, else downsample
+        // Streaming volumes: upload the 4x downsampled MIP volume ("low")
+        // Standard volumes: only upload full when dimensions and memory budget are safe.
         const mipVolume = volume.getMIPVolume();
-        const maxDim3D = this.gpu?.device.limits.maxTextureDimension3D ?? 0;
-        const [mnx, mny, mnz] = mipVolume.dimensions;
-        const dimsFit = mnx <= maxDim3D && mny <= maxDim3D && mnz <= maxDim3D;
         if (this.mipRenderer) {
-            if (dimsFit) {
-                this.mipRenderer.uploadVolume(mipVolume);
-                this.current3DResolution = volume.isStreaming ? 'low' : 'full';
-                this.update3DResolutionIndicator(mipVolume);
-            } else {
-                // Full data too large for 3D texture — generate 4x downsample async
-                console.warn(`MIP volume (${mnx}×${mny}×${mnz}) exceeds 3D texture limit (${maxDim3D}), downsampling`);
+            const uploadOrDisable = (vol: VolumeData, resolution: 'low' | 'mid' | 'full'): boolean => {
+                if (!this.mipRenderer || this.volume !== volume) return false;
+                if (!this.canUploadVolumeTo3D(vol)) {
+                    this.mipRenderer.unloadVolume();
+                    this.mipRenderer.clear();
+                    this.set3DStatusText('3D disabled: volume too large for GPU memory');
+                    this.mark3DMaskDirty();
+                    return false;
+                }
+                try {
+                    this.mipRenderer.uploadVolume(vol);
+                    this.current3DResolution = resolution;
+                    this.update3DResolutionIndicator(vol);
+                    this.set3DStatusText('');
+                    this.mark3DMaskDirty();
+                    this.mark3DPaletteDirty();
+                    this.schedule3DMaskSync({ immediate: true, render: false });
+                    return true;
+                } catch (error) {
+                    console.error('3D upload failed:', error);
+                    this.mipRenderer.unloadVolume();
+                    this.mipRenderer.clear();
+                    this.set3DStatusText('3D upload failed');
+                    this.mark3DMaskDirty();
+                    return false;
+                }
+            };
+
+            const uploadedInitial = !volume.isStreaming && this.canUploadVolumeTo3D(mipVolume)
+                ? uploadOrDisable(mipVolume, 'full')
+                : false;
+
+            if (!uploadedInitial) {
                 this.current3DResolution = 'low';
-                const status = document.getElementById('resolution3DStatus');
-                if (mipVolume.canEnhance3D()) {
-                    if (status) status.textContent = '0%';
+
+                if (volume.isStreaming) {
+                    uploadOrDisable(mipVolume, 'low');
+                } else if (mipVolume.canEnhance3D()) {
+                    this.set3DStatusText('0%');
                     mipVolume.createDownsampledVolume(4, (pct) => {
-                        if (status) status.textContent = `${pct}%`;
+                        this.set3DStatusText(`${pct}%`);
                     }).then((downsampled) => {
-                        if (status) status.textContent = '';
-                        if (downsampled && this.mipRenderer && this.volume === volume) {
-                            this.mipRenderer.uploadVolume(downsampled);
-                            this.cached3DVolumes.set('low', downsampled);
-                            this.update3DResolutionIndicator(downsampled);
+                        if (!downsampled || this.volume !== volume) {
+                            return;
+                        }
+                        this.volumeStore.cache3DVolume('low', downsampled);
+                        const ok = uploadOrDisable(downsampled, 'low');
+                        if (ok && this.mipRenderer) {
                             this.mipRenderer.render();
                         }
+                    }).catch((error) => {
+                        console.error('Failed generating low-res 3D volume:', error);
+                        this.set3DStatusText('3D preparation failed');
                     });
+                } else {
+                    uploadOrDisable(mipVolume, 'low');
                 }
             }
             this.mipRenderer.resetCamera();
@@ -287,11 +1821,14 @@ export class ViewerApp {
         this.drawHistogram();
         this.updateHandlePositions();
 
-        // Show sidebar controls
+        // Show floating controls once a volume is loaded
         const sliceControls = document.getElementById('sliceControls');
-        if (sliceControls) sliceControls.style.display = 'block';
+        if (sliceControls) sliceControls.classList.add('visible');
         const quality3D = document.getElementById('quality3DGroup');
         if (quality3D) quality3D.style.display = 'block';
+        this.updateSegmentationPanelVisibility();
+        this.syncModeButtons();
+        this.updateInteractionCursor();
 
         // Sync zoom/pan/crosshair to renderers
         this.syncZoomPan();
@@ -301,8 +1838,37 @@ export class ViewerApp {
 
         // Update 3D resolution dropdown options
         this.update3DResolutionOptions();
+        this.update3DStatusChip();
+        this.mark3DPaletteDirty();
+        this.schedule3DMaskSync({ render: false });
 
         this.renderAll();
+    }
+
+    private estimate3DUploadBytesForDims(nx: number, ny: number, nz: number): number {
+        const voxels = nx * ny * nz;
+        const texelBytes = this.gpu?.supportsFloat32Filtering ? 4 : 2;
+        const volumeBytes = voxels * texelBytes;
+        const brickCount = Math.ceil(nx / BRICK_SIZE) * Math.ceil(ny / BRICK_SIZE) * Math.ceil(nz / BRICK_SIZE);
+        const brickBytes = brickCount * 4; // rg16float
+        // Small safety factor for driver-side allocation overhead.
+        return Math.ceil((volumeBytes + brickBytes) * 1.15);
+    }
+
+    private canUploadDimsTo3D(nx: number, ny: number, nz: number): boolean {
+        const maxDim3D = this.gpu?.device.limits.maxTextureDimension3D ?? 0;
+        if (nx > maxDim3D || ny > maxDim3D || nz > maxDim3D) return false;
+        return this.estimate3DUploadBytesForDims(nx, ny, nz) <= MAX_SAFE_3D_UPLOAD_BYTES;
+    }
+
+    private canUploadVolumeTo3D(vol: VolumeData): boolean {
+        const [nx, ny, nz] = vol.dimensions;
+        return this.canUploadDimsTo3D(nx, ny, nz);
+    }
+
+    private set3DStatusText(text: string): void {
+        const status = document.getElementById('resolution3DStatus');
+        if (status) status.textContent = text;
     }
 
     /**
@@ -328,20 +1894,25 @@ export class ViewerApp {
         const lowNx = Math.ceil(nx / 4);
         const lowNy = Math.ceil(ny / 4);
         const lowNz = Math.ceil(nz / 4);
-        lowOption.textContent = `Low (${lowNx}×${lowNy}×${lowNz})`;
-        lowOption.disabled = false;
+        lowOption.textContent = `Low (${lowNx}x${lowNy}x${lowNz})`;
+        const canLow = this.canUploadDimsTo3D(lowNx, lowNy, lowNz);
+        lowOption.disabled = !canLow;
 
         // Mid (2x downsample)
         const midNx = Math.ceil(nx / 2);
         const midNy = Math.ceil(ny / 2);
         const midNz = Math.ceil(nz / 2);
-        const canMid = volume.canEnhance3D() && midNx <= maxDim3D && midNy <= maxDim3D && midNz <= maxDim3D;
-        midOption.textContent = `Mid (${midNx}×${midNy}×${midNz})`;
+        const canMid = volume.canEnhance3D() &&
+            midNx <= maxDim3D && midNy <= maxDim3D && midNz <= maxDim3D &&
+            this.canUploadDimsTo3D(midNx, midNy, midNz);
+        midOption.textContent = `Mid (${midNx}x${midNy}x${midNz})`;
         midOption.disabled = !canMid;
 
         // Full
-        const canFull = !volume.isStreaming && nx <= maxDim3D && ny <= maxDim3D && nz <= maxDim3D;
-        fullOption.textContent = `Full (${nx}×${ny}×${nz})`;
+        const canFull = !volume.isStreaming &&
+            nx <= maxDim3D && ny <= maxDim3D && nz <= maxDim3D &&
+            this.canUploadDimsTo3D(nx, ny, nz);
+        fullOption.textContent = `Full (${nx}x${ny}x${nz})`;
         fullOption.disabled = !canFull;
 
         // If current selection is now disabled, fall back
@@ -349,7 +1920,18 @@ export class ViewerApp {
             (this.current3DResolution === 'full' && fullOption.disabled)) {
             this.current3DResolution = 'low';
         }
+        if (lowOption.disabled && !midOption.disabled) {
+            this.current3DResolution = 'mid';
+        } else if (lowOption.disabled && midOption.disabled && !fullOption.disabled) {
+            this.current3DResolution = 'full';
+        }
         select.value = this.current3DResolution;
+        if (lowOption.disabled && midOption.disabled && fullOption.disabled) {
+            this.set3DStatusText('3D disabled: memory budget exceeded');
+        } else if (document.getElementById('resolution3DStatus')?.textContent === '3D disabled: memory budget exceeded') {
+            this.set3DStatusText('');
+        }
+        this.update3DStatusChip();
     }
 
     /**
@@ -359,7 +1941,8 @@ export class ViewerApp {
         const indicator = document.getElementById('resolution3D');
         if (!indicator) return;
         const [nx, ny, nz] = vol.dimensions;
-        indicator.textContent = `${nx}×${ny}×${nz}`;
+        indicator.textContent = `${nx}x${ny}x${nz}`;
+        this.update3DStatusChip();
     }
 
     /**
@@ -376,14 +1959,31 @@ export class ViewerApp {
         const savedMin = this.mipRenderer.displayMin;
         const savedMax = this.mipRenderer.displayMax;
 
-        const uploadAndRender = (vol: VolumeData) => {
-            this.mipRenderer!.uploadVolume(vol);
+        const uploadAndRender = (vol: VolumeData): boolean => {
+            if (!this.canUploadVolumeTo3D(vol)) {
+                this.set3DStatusText('Volume too large for GPU memory');
+                return false;
+            }
+            try {
+                this.mipRenderer!.uploadVolume(vol);
+            } catch (error) {
+                console.error('3D upload failed while changing resolution:', error);
+                this.mipRenderer!.unloadVolume();
+                this.mipRenderer!.clear();
+                this.set3DStatusText('3D upload failed');
+                this.mark3DMaskDirty();
+                return false;
+            }
+            this.mark3DMaskDirty();
+            this.mark3DPaletteDirty();
+            this.sync3DMaskOverlayNow(false);
             // Restore user's window/level
             this.mipRenderer!.displayMin = savedMin;
             this.mipRenderer!.displayMax = savedMax;
             this.mipRenderer!.render();
             // Update 3D resolution indicator
             this.update3DResolutionIndicator(vol);
+            return true;
         };
 
         const clearStatus = () => {
@@ -394,12 +1994,20 @@ export class ViewerApp {
             if (value === 'low') {
                 if (this.volume.isStreaming) {
                     // Streaming: getMIPVolume() is the 4x downsampled lowRes
-                    uploadAndRender(this.volume.getMIPVolume());
+                    if (!uploadAndRender(this.volume.getMIPVolume())) {
+                        if (select) select.value = this.current3DResolution;
+                        this.update3DStatusChip();
+                        return;
+                    }
                 } else {
                     // Standard: generate 4x downsample on demand
-                    const cached = this.cached3DVolumes.get('low');
+                    const cached = this.volumeStore.getCached3DVolume('low');
                     if (cached) {
-                        uploadAndRender(cached);
+                        if (!uploadAndRender(cached)) {
+                            if (select) select.value = this.current3DResolution;
+                            this.update3DStatusChip();
+                            return;
+                        }
                     } else {
                         if (select) select.disabled = true;
                         if (status) status.textContent = '0%';
@@ -409,10 +2017,15 @@ export class ViewerApp {
                         if (select) select.disabled = false;
                         clearStatus();
                         if (lowVol) {
-                            this.cached3DVolumes.set('low', lowVol);
-                            uploadAndRender(lowVol);
+                            this.volumeStore.cache3DVolume('low', lowVol);
+                            if (!uploadAndRender(lowVol)) {
+                                if (select) select.value = this.current3DResolution;
+                                this.update3DStatusChip();
+                                return;
+                            }
                         } else {
                             if (select) select.value = this.current3DResolution;
+                            this.update3DStatusChip();
                             return;
                         }
                     }
@@ -420,12 +2033,17 @@ export class ViewerApp {
                 this.current3DResolution = 'low';
 
             } else if (value === 'mid') {
-                const cached = this.cached3DVolumes.get('mid');
+                const cached = this.volumeStore.getCached3DVolume('mid');
                 if (cached) {
-                    uploadAndRender(cached);
+                    if (!uploadAndRender(cached)) {
+                        if (select) select.value = this.current3DResolution;
+                        this.update3DStatusChip();
+                        return;
+                    }
                 } else {
                     if (!this.volume.canEnhance3D()) {
                         if (select) select.value = this.current3DResolution;
+                        this.update3DStatusChip();
                         return;
                     }
                     if (select) select.disabled = true;
@@ -436,10 +2054,15 @@ export class ViewerApp {
                     if (select) select.disabled = false;
                     clearStatus();
                     if (midVol) {
-                        this.cached3DVolumes.set('mid', midVol);
-                        uploadAndRender(midVol);
+                        this.volumeStore.cache3DVolume('mid', midVol);
+                        if (!uploadAndRender(midVol)) {
+                            if (select) select.value = this.current3DResolution;
+                            this.update3DStatusChip();
+                            return;
+                        }
                     } else {
                         if (select) select.value = this.current3DResolution;
+                        this.update3DStatusChip();
                         return;
                     }
                 }
@@ -448,11 +2071,17 @@ export class ViewerApp {
             } else if (value === 'full') {
                 if (this.volume.isStreaming) {
                     if (select) select.value = this.current3DResolution;
+                    this.update3DStatusChip();
                     return;
                 }
-                uploadAndRender(this.volume as VolumeData);
+                if (!uploadAndRender(this.volume as VolumeData)) {
+                    if (select) select.value = this.current3DResolution;
+                    this.update3DStatusChip();
+                    return;
+                }
                 this.current3DResolution = 'full';
             }
+            this.update3DStatusChip();
         } catch (error) {
             console.error('Failed to set 3D resolution:', error);
             if (select) {
@@ -460,6 +2089,7 @@ export class ViewerApp {
                 select.value = this.current3DResolution;
             }
             clearStatus();
+            this.update3DStatusChip();
         }
     }
 
@@ -493,14 +2123,54 @@ export class ViewerApp {
         const group = groups[0];
         const name = group.name;
 
-        // Dispose previous streaming volume if any
-        if (this.volume && this.volume.isStreaming) {
-            this.volume.dispose();
-        }
-
         // Reset 3D resolution cache for new volume
-        this.cached3DVolumes.clear();
-        this.current3DResolution = 'low';
+        this.clear3DMaskSyncTimer();
+        this.mask3DSyncWantsRender = false;
+        this.volumeStore.clear({ disposeStreaming: true, resetResolution: true });
+        this.segmentationStore.clearMask();
+        this.maskSliceBuffers = { xy: null, xz: null, yz: null };
+        this.maskDisplaySliceBuffers = { xy: null, xz: null, yz: null };
+        this.mask3DLookupCache = null;
+        this.mask3DLabelBuffer = null;
+        this.mark3DMaskDirty();
+        this.mark3DPaletteDirty();
+        this.segmentationDragging = false;
+        this.segmentationDragAxis = null;
+        this.activePaintStrokeId = null;
+        this.segmentationWorkerBusy = false;
+        this.resetRoiEntries();
+
+        const seg = this.uiState.state.segmentation;
+        this.uiState.update({
+            appMode: AppMode.Viewing,
+            segmentation: {
+                ...seg,
+                enabled: false,
+                visible: true,
+                overlayOpacity: 0.4,
+                color: [1.0, 0.0, 0.0],
+                activeROIId: null,
+                activeTool: 'brush',
+                showOnlyActive: false,
+                aiPreviewMask: null,
+                isPinned: seg.isPinned,
+                activeClassId: 1,
+                tool: 'brush',
+                brushRadius: 8,
+                paintValue: 1,
+                thresholdMin: 0,
+                thresholdMax: 0,
+                regionGrowTolerance: 25,
+                regionGrowSliceRadius: 1,
+            },
+        });
+        this.updateSegmentationToolRows('brush');
+        this.updateSegmentationToolButtons('brush');
+        this.updateSegmentationBrushButtons(1);
+        this.syncModeButtons();
+        this.updateSegmentationPanelVisibility();
+        this.updateInteractionCursor();
+        this.schedule3DMaskSync({ immediate: true, render: true });
 
         this.uiState.setLoading(true);
         this.showLoadingOverlay('Loading...');
@@ -515,25 +2185,30 @@ export class ViewerApp {
                 // onVolumeSwap: hybrid mode background load completed
                 (fullVolume) => {
                     console.log('Full volume loaded, swapping from streaming');
-                    // Dispose the streaming volume
-                    if (this.volume && this.volume.isStreaming) {
-                        this.volume.dispose();
-                    }
-                    // Reset 3D resolution cache since we have new full data
-                    this.cached3DVolumes.clear();
-                    this.current3DResolution = 'low';
-                    this.volume = fullVolume;
+                    this.volumeStore.replaceVolume(fullVolume, {
+                        disposePreviousStreaming: true,
+                        reset3DCache: true,
+                        resetResolution: true,
+                    });
                     const fullInfo = fullVolume.getInfo();
                     this.fileNameEl.textContent = name;
                     const [w, h, d] = fullInfo.dimensions;
                     this.imageInfoEl.textContent =
-                        `${w}×${h}×${d} ${fullInfo.dataType} ${fullInfo.memorySizeMB}MB`;
+                        `${w}x${h}x${d} ${fullInfo.dataType} ${fullInfo.memorySizeMB}MB`;
+                    this.setSegmentationState({
+                        thresholdMin: fullVolume.min,
+                        thresholdMax: fullVolume.max,
+                    });
                     this.displayVolume();
                     this.hideLoadingOverlay();
                 },
             );
 
-            this.volume = volume;
+            this.volumeStore.replaceVolume(volume, {
+                disposePreviousStreaming: false,
+                reset3DCache: false,
+                resetResolution: false,
+            });
 
             // Wire streaming callbacks if applicable
             if (volume.isStreaming) {
@@ -547,8 +2222,12 @@ export class ViewerApp {
             this.fileNameEl.textContent = name + suffix;
             const [w, h, d] = info.dimensions;
             this.imageInfoEl.textContent =
-                `${w}×${h}×${d} ${info.dataType} ${info.memorySizeMB}MB${suffix}`;
+                `${w}x${h}x${d} ${info.dataType} ${info.memorySizeMB}MB${suffix}`;
 
+            this.setSegmentationState({
+                thresholdMin: volume.min,
+                thresholdMax: volume.max,
+            });
             this.displayVolume();
             this.uiState.setFileLoaded(name);
         } catch (err) {
@@ -615,6 +2294,220 @@ export class ViewerApp {
     // 2D viewport interactions (pan, zoom, scroll, crosshair, maximize)
     // ================================================================
 
+    private shouldUseBrushTool(): boolean {
+        const seg = this.uiState.state.segmentation;
+        const active = this.getActiveRoi();
+        return !!this.maskVolume
+            && this.isSegmentationMode()
+            && seg.enabled
+            && seg.tool === 'brush'
+            && !!active
+            && !active.locked;
+    }
+
+    private shouldUseThresholdTool(): boolean {
+        const seg = this.uiState.state.segmentation;
+        const active = this.getActiveRoi();
+        return !!this.maskVolume
+            && this.isSegmentationMode()
+            && seg.enabled
+            && seg.tool === 'threshold'
+            && !!active
+            && !active.locked;
+    }
+
+    private shouldUseRegionGrowTool(): boolean {
+        const seg = this.uiState.state.segmentation;
+        const active = this.getActiveRoi();
+        return !!this.maskVolume
+            && this.isSegmentationMode()
+            && seg.enabled
+            && seg.tool === 'region-grow'
+            && !!active
+            && !active.locked;
+    }
+
+    private getSliceHitFromClient(axis: ViewAxis, clientX: number, clientY: number): SliceHit | null {
+        const renderer = this.sliceRenderers[axis];
+        const canvas = this.sliceCanvases[axis];
+        if (!renderer || !canvas) return null;
+        const rect = canvas.getBoundingClientRect();
+        const dpr = canvas.width / canvas.clientWidth;
+        const canvasX = (clientX - rect.left) * dpr;
+        const canvasY = (clientY - rect.top) * dpr;
+        const [sliceX, sliceY] = renderer.canvasToSlice(canvasX, canvasY);
+        if (sliceX < 0 || sliceY < 0) return null;
+        return {
+            renderer,
+            sliceIndex: this.uiState.state.slices[axis],
+            sliceX,
+            sliceY,
+        };
+    }
+
+    private applySegmentationOp(op: SegmentationOp): number {
+        const changed = this.segmentationStore.applyOp(op);
+        if (changed > 0) {
+            this.mark3DMaskDirty();
+        }
+        return changed;
+    }
+
+    private setActiveRoiBusy(roiId: string | null, busy: boolean): void {
+        const roi = this.findRoiById(roiId);
+        if (!roi || roi.aiBusy === busy) return;
+        roi.aiBusy = busy;
+        this.refreshSegmentationOverlayUI();
+    }
+
+    private applySelectionIndicesToActiveRoi(
+        axis: ViewAxis,
+        sliceIndex: number,
+        width: number,
+        height: number,
+        selectedIndices: Uint32Array,
+    ): number {
+        const active = this.getActiveRoi();
+        if (!active) return 0;
+        const op = createApplySliceSelectionOp({
+            axis,
+            sliceIndex,
+            width,
+            height,
+            selectedIndices,
+            classId: active.classId,
+        });
+        return this.applySegmentationOp(op);
+    }
+
+    private paintBrushAtClient(axis: ViewAxis, clientX: number, clientY: number): number {
+        const hit = this.getSliceHitFromClient(axis, clientX, clientY);
+        if (!hit) return 0;
+        const seg = this.uiState.state.segmentation;
+        const active = this.getActiveRoi();
+        if (seg.paintValue !== 0 && (!active || active.locked)) return 0;
+        const classId = seg.paintValue === 0 ? 0 : active!.classId;
+        const mergeKey = this.activePaintStrokeId != null ? `paint-stroke:${this.activePaintStrokeId}` : undefined;
+        const op = createPaintStrokeOp({
+            axis,
+            sliceIndex: hit.sliceIndex,
+            sliceX: hit.sliceX,
+            sliceY: hit.sliceY,
+            radius: seg.brushRadius,
+            classId,
+            sliceRadius: 0,
+            mergeKey,
+            onVoxelChanged: (x, y, z, previousClassId, nextClassId) => {
+                this.applyVoxelChangeToActiveRoiStats(x, y, z, previousClassId, nextClassId);
+            },
+        });
+        const changed = this.applySegmentationOp(op);
+        if (changed > 0) {
+            this.scheduleAxisRender(axis);
+            this.updatePixelInfo();
+            this.scheduleActiveRoiStatsRefresh();
+            this.schedule3DMaskSync({ render: true });
+        }
+        return changed;
+    }
+
+    private async runThresholdToolAtClient(axis: ViewAxis, clientX: number, clientY: number): Promise<void> {
+        if (this.segmentationWorkerBusy || !this.volume) return;
+        const hit = this.getSliceHitFromClient(axis, clientX, clientY);
+        if (!hit) return;
+        const active = this.getActiveRoi();
+        if (!active || active.locked) return;
+        const seg = this.uiState.state.segmentation;
+        this.segmentationWorkerBusy = true;
+        this.setActiveRoiBusy(active.id, true);
+        try {
+            const slice = this.volume.getSlice(axis, hit.sliceIndex);
+            const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
+            const selected = await this.segmentationWorker.runThresholdSlice({
+                width: slice.width,
+                height: slice.height,
+                values,
+                min: Math.min(seg.thresholdMin, seg.thresholdMax),
+                max: Math.max(seg.thresholdMin, seg.thresholdMax),
+            });
+            const changed = this.applySelectionIndicesToActiveRoi(axis, hit.sliceIndex, slice.width, slice.height, selected);
+            if (changed > 0) {
+                this.invalidateActiveRoiStats();
+                this.scheduleAxisRender(axis);
+                this.scheduleActiveRoiStatsRefresh({ force: true });
+                this.updatePixelInfo();
+                this.schedule3DMaskSync({ immediate: true, render: true });
+            }
+        } catch (error) {
+            console.error('Threshold tool failed:', error);
+        } finally {
+            this.segmentationWorkerBusy = false;
+            this.setActiveRoiBusy(active.id, false);
+        }
+    }
+
+    private async runRegionGrowToolAtClient(axis: ViewAxis, clientX: number, clientY: number): Promise<void> {
+        if (this.segmentationWorkerBusy || !this.volume) return;
+        const hit = this.getSliceHitFromClient(axis, clientX, clientY);
+        if (!hit) return;
+        const active = this.getActiveRoi();
+        if (!active || active.locked) return;
+        const seg = this.uiState.state.segmentation;
+        this.segmentationWorkerBusy = true;
+        this.setActiveRoiBusy(active.id, true);
+        try {
+            const slice = this.volume.getSlice(axis, hit.sliceIndex);
+            const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
+            const sx = Math.max(0, Math.min(slice.width - 1, Math.floor(hit.sliceX)));
+            const sy = Math.max(0, Math.min(slice.height - 1, Math.floor(hit.sliceY)));
+            const seedIndex = sy * slice.width + sx;
+            const selected = await this.segmentationWorker.runRegionGrowSlice({
+                width: slice.width,
+                height: slice.height,
+                values,
+                seedIndex,
+                tolerance: Math.max(0, seg.regionGrowTolerance),
+            });
+            const changed = this.applySelectionIndicesToActiveRoi(axis, hit.sliceIndex, slice.width, slice.height, selected);
+            if (changed > 0) {
+                this.invalidateActiveRoiStats();
+                this.scheduleAxisRender(axis);
+                this.scheduleActiveRoiStatsRefresh({ force: true });
+                this.updatePixelInfo();
+                this.schedule3DMaskSync({ immediate: true, render: true });
+            }
+        } catch (error) {
+            console.error('Region grow tool failed:', error);
+        } finally {
+            this.segmentationWorkerBusy = false;
+            this.setActiveRoiBusy(active.id, false);
+        }
+    }
+
+    private undoSegmentationEdit(): void {
+        if (!this.segmentationStore.canUndo()) return;
+        const changed = this.segmentationStore.undo();
+        if (changed <= 0) return;
+        this.invalidateActiveRoiStats();
+        this.mark3DMaskDirty();
+        this.scheduleSliceRender();
+        this.scheduleActiveRoiStatsRefresh({ force: true });
+        this.updatePixelInfo();
+        this.schedule3DMaskSync({ immediate: true, render: true });
+    }
+
+    private redoSegmentationEdit(): void {
+        if (!this.segmentationStore.canRedo()) return;
+        const changed = this.segmentationStore.redo();
+        if (changed <= 0) return;
+        this.invalidateActiveRoiStats();
+        this.mark3DMaskDirty();
+        this.scheduleSliceRender();
+        this.scheduleActiveRoiStatsRefresh({ force: true });
+        this.updatePixelInfo();
+        this.schedule3DMaskSync({ immediate: true, render: true });
+    }
+
     private init2DControls(): void {
         for (const axis of AXES) {
             const canvas = this.sliceCanvases[axis];
@@ -625,7 +2518,7 @@ export class ViewerApp {
                 this.activeAxis = axis;
                 if (!this.volume) return;
 
-                if (this.roiMode) {
+                if (this.isMeasuringMode()) {
                     // ROI mode: start drawing rectangle
                     this.roiDragging = true;
                     this.roiAxis = axis;
@@ -633,6 +2526,22 @@ export class ViewerApp {
                     this.roiStartCSS = { x: e.clientX - containerRect.left, y: e.clientY - containerRect.top };
                     this.roiEndCSS = { ...this.roiStartCSS };
                     this.createRoiOverlay(axis);
+                    return;
+                }
+
+                if (this.shouldUseBrushTool()) {
+                    this.activePaintStrokeId = this.nextPaintStrokeId++;
+                    this.segmentationDragging = true;
+                    this.segmentationDragAxis = axis;
+                    this.paintBrushAtClient(axis, e.clientX, e.clientY);
+                    return;
+                }
+                if (this.shouldUseThresholdTool()) {
+                    void this.runThresholdToolAtClient(axis, e.clientX, e.clientY);
+                    return;
+                }
+                if (this.shouldUseRegionGrowTool()) {
+                    void this.runRegionGrowToolAtClient(axis, e.clientX, e.clientY);
                     return;
                 }
 
@@ -682,6 +2591,11 @@ export class ViewerApp {
                 const containerRect = this.viewportContainers[this.roiAxis].getBoundingClientRect();
                 this.roiEndCSS = { x: e.clientX - containerRect.left, y: e.clientY - containerRect.top };
                 this.updateRoiOverlay();
+                return;
+            }
+
+            if (this.segmentationDragging && this.segmentationDragAxis) {
+                this.paintBrushAtClient(this.segmentationDragAxis, e.clientX, e.clientY);
                 return;
             }
 
@@ -735,6 +2649,15 @@ export class ViewerApp {
                 return;
             }
 
+            if (this.segmentationDragging) {
+                this.segmentationDragging = false;
+                this.segmentationDragAxis = null;
+                this.activePaintStrokeId = null;
+                this.scheduleActiveRoiStatsRefresh({ force: true });
+                this.schedule3DMaskSync({ immediate: true, render: true });
+                return;
+            }
+
             if (!this.slice2DDragging) return;
             this.slice2DDragging = false;
 
@@ -770,7 +2693,7 @@ export class ViewerApp {
 
         // Show/hide pixel info
         if (this.pixelInfoGroup) {
-            this.pixelInfoGroup.style.display = this.crosshairsEnabled ? 'block' : 'none';
+            this.pixelInfoGroup.style.display = this.crosshairsEnabled ? 'inline-flex' : 'none';
         }
 
         this.updateCrosshairs();
@@ -858,7 +2781,9 @@ export class ViewerApp {
         if (!this.volume || !this.pixelInfoEl) return;
         const { x, y, z } = this.crosshairPos;
         const val = this.volume.getValue(x, y, z);
-        this.pixelInfoEl.textContent = `X: ${x}, Y: ${y}, Z: ${z} = ${val ?? '—'}`;
+        const maskVal = this.maskVolume ? this.maskVolume.getVoxel(x, y, z) : 0;
+        const intVal = val == null ? '-' : Math.round(val).toString();
+        this.pixelInfoEl.textContent = `X: ${x}, Y: ${y}, Z: ${z} = ${intVal} | Mask: ${maskVal}`;
     }
 
     // ================================================================
@@ -866,17 +2791,7 @@ export class ViewerApp {
     // ================================================================
 
     private setRoiMode(on: boolean): void {
-        this.roiMode = on;
-        this.uiState.update({ roiMode: on });
-
-        const btn = document.getElementById('roiBtn');
-        if (btn) btn.classList.toggle('active', on);
-
-        // Change cursor on all 2D canvases
-        for (const axis of AXES) {
-            const c = this.sliceCanvases[axis];
-            if (c) c.style.cursor = on ? 'crosshair' : '';
-        }
+        this.setAppMode(on ? AppMode.Measuring : AppMode.Viewing);
 
         if (!on) {
             this.roiDragging = false;
@@ -885,7 +2800,7 @@ export class ViewerApp {
     }
 
     private toggleRoiMode(): void {
-        this.setRoiMode(!this.roiMode);
+        this.setRoiMode(!this.isMeasuringMode());
     }
 
     private createRoiOverlay(axis: ViewAxis): void {
@@ -1184,6 +3099,7 @@ export class ViewerApp {
         canvas.addEventListener('mousedown', (e) => {
             if (!this.mipRenderer || !this.volume) return;
             dragging = true;
+            this.begin3DInteractionQuality();
             lastX = e.clientX;
             lastY = e.clientY;
             canvas.style.cursor = 'grabbing';
@@ -1209,18 +3125,21 @@ export class ViewerApp {
             if (dragging) {
                 dragging = false;
                 canvas.style.cursor = 'grab';
+                this.end3DInteractionQuality();
             }
         });
 
         canvas.addEventListener('wheel', (e) => {
             if (!this.mipRenderer || !this.volume) return;
             e.preventDefault();
+            this.begin3DInteractionQuality();
 
             const delta = e.deltaY > 0 ? -0.1 : 0.1;
             this.mipRenderer.distance = Math.max(0.3, Math.min(5.0,
                 this.mipRenderer.distance + delta));
 
             this.mipRenderer.render();
+            this.end3DInteractionQuality();
         }, { passive: false });
 
         // Double-click: maximize 3D view
@@ -1233,21 +3152,51 @@ export class ViewerApp {
     // Sidebar controls
     // ================================================================
 
+    private updateSegmentationToolRows(tool: SegmentationTool): void {
+        const brushRow = document.getElementById('segBrushRow');
+        const thresholdRow = document.getElementById('segThresholdRow');
+        const growRow = document.getElementById('segGrowRow');
+        if (brushRow) brushRow.style.display = tool === 'brush' ? '' : 'none';
+        if (thresholdRow) thresholdRow.style.display = tool === 'threshold' ? '' : 'none';
+        if (growRow) growRow.style.display = tool === 'region-grow' ? '' : 'none';
+    }
+
+    private updateSegmentationToolButtons(tool: SegmentationTool): void {
+        const brushBtn = document.getElementById('segToolBrushBtn');
+        const thresholdBtn = document.getElementById('segToolThresholdBtn');
+        const growBtn = document.getElementById('segToolGrowBtn');
+        if (brushBtn) brushBtn.classList.toggle('active', tool === 'brush');
+        if (thresholdBtn) thresholdBtn.classList.toggle('active', tool === 'threshold');
+        if (growBtn) growBtn.classList.toggle('active', tool === 'region-grow');
+    }
+
+    private updateSegmentationBrushButtons(paintValue: 0 | 1): void {
+        const drawBtn = document.getElementById('segBrushDrawBtn');
+        const eraseBtn = document.getElementById('segBrushEraseBtn');
+        if (drawBtn) drawBtn.classList.toggle('active', paintValue === 1);
+        if (eraseBtn) eraseBtn.classList.toggle('active', paintValue === 0);
+    }
+
     private initSidebarControls(): void {
         // 3D Resolution select
         const resolutionSelect = document.getElementById('resolution3DSelect') as HTMLSelectElement | null;
         if (resolutionSelect) {
             resolutionSelect.addEventListener('change', async () => {
                 await this.set3DResolution(resolutionSelect.value as 'low' | 'mid' | 'full');
+                this.update3DStatusChip();
             });
         }
 
         // Quality select
         const qualitySelect = document.getElementById('quality3DSelect') as HTMLSelectElement | null;
         if (qualitySelect) {
+            this.preferred3DQuality = qualitySelect.value as QualityPreset;
             qualitySelect.addEventListener('change', () => {
-                this.mipRenderer?.setQuality(qualitySelect.value);
-                this.mipRenderer?.render();
+                this.preferred3DQuality = qualitySelect.value as QualityPreset;
+                if (this.mipRenderer && !this.interactionQualityActive) {
+                    this.mipRenderer.setQuality(this.preferred3DQuality);
+                    this.mipRenderer.render();
+                }
             });
         }
 
@@ -1335,6 +3284,944 @@ export class ViewerApp {
             roiBtn.removeAttribute('disabled');
             roiBtn.addEventListener('click', () => this.toggleRoiMode());
         }
+        if (this.segModeBtn) {
+            this.segModeBtn.removeAttribute('disabled');
+            this.segModeBtn.addEventListener('click', () => this.toggleSegmentationMode());
+        }
+        this.syncModeButtons();
+
+        // Segmentation controls
+        const segEnableToggle = document.getElementById('segEnableToggle') as HTMLInputElement | null;
+        const segVisibleToggle = document.getElementById('segVisibleToggle') as HTMLInputElement | null;
+        const segOpacitySlider = document.getElementById('segOpacitySlider') as HTMLInputElement | null;
+        const segOpacityValue = document.getElementById('segOpacityValue');
+        const segToolBrushBtn = document.getElementById('segToolBrushBtn') as HTMLButtonElement | null;
+        const segToolThresholdBtn = document.getElementById('segToolThresholdBtn') as HTMLButtonElement | null;
+        const segToolGrowBtn = document.getElementById('segToolGrowBtn') as HTMLButtonElement | null;
+        const segBrushDrawBtn = document.getElementById('segBrushDrawBtn') as HTMLButtonElement | null;
+        const segBrushEraseBtn = document.getElementById('segBrushEraseBtn') as HTMLButtonElement | null;
+        const segBrushSize = document.getElementById('segBrushSize') as HTMLInputElement | null;
+        const segBrushSizeValue = document.getElementById('segBrushSizeValue');
+        const segThresholdMin = document.getElementById('segThresholdMin') as HTMLInputElement | null;
+        const segThresholdMax = document.getElementById('segThresholdMax') as HTMLInputElement | null;
+        const segGrowTolerance = document.getElementById('segGrowTolerance') as HTMLInputElement | null;
+        const segGrowRadius = document.getElementById('segGrowRadius') as HTMLInputElement | null;
+        const segShowOnlyActiveToggle = document.getElementById('segShowOnlyActiveToggle') as HTMLInputElement | null;
+        const segDuplicateRoiBtn = document.getElementById('segDuplicateRoiBtn') as HTMLButtonElement | null;
+        const segMergeRoiBtn = document.getElementById('segMergeRoiBtn') as HTMLButtonElement | null;
+        const segExportRoiBtn = document.getElementById('segExportRoiBtn') as HTMLButtonElement | null;
+        const segImportRoiBtn = document.getElementById('segImportRoiBtn') as HTMLButtonElement | null;
+        const segExportSegBtn = document.getElementById('segExportSegBtn') as HTMLButtonElement | null;
+        const segImportSegBtn = document.getElementById('segImportSegBtn') as HTMLButtonElement | null;
+        const segPropagateBtn = document.getElementById('segPropagateBtn') as HTMLButtonElement | null;
+
+        const seg = this.uiState.state.segmentation;
+        if (segEnableToggle) segEnableToggle.checked = seg.enabled;
+        if (segVisibleToggle) segVisibleToggle.checked = seg.visible;
+        if (segOpacitySlider) segOpacitySlider.value = seg.overlayOpacity.toFixed(2);
+        if (segOpacityValue) segOpacityValue.textContent = seg.overlayOpacity.toFixed(2);
+        if (segBrushSize) segBrushSize.value = String(seg.brushRadius);
+        if (segBrushSizeValue) segBrushSizeValue.textContent = String(seg.brushRadius);
+        if (segThresholdMin) segThresholdMin.value = String(Math.round(seg.thresholdMin));
+        if (segThresholdMax) segThresholdMax.value = String(Math.round(seg.thresholdMax));
+        if (segGrowTolerance) segGrowTolerance.value = String(Math.round(seg.regionGrowTolerance));
+        if (segGrowRadius) segGrowRadius.value = String(seg.regionGrowSliceRadius);
+        if (segShowOnlyActiveToggle) segShowOnlyActiveToggle.checked = seg.showOnlyActive;
+        this.updateSegmentationToolRows(seg.tool);
+        this.updateSegmentationToolButtons(seg.tool);
+        this.updateSegmentationBrushButtons(seg.paintValue);
+        this.updateSegmentationPanelVisibility();
+
+        if (segEnableToggle) {
+            segEnableToggle.addEventListener('change', () => {
+                this.setSegmentationState({ enabled: segEnableToggle.checked });
+            });
+        }
+        if (segVisibleToggle) {
+            segVisibleToggle.addEventListener('change', () => {
+                this.setSegmentationState({ visible: segVisibleToggle.checked });
+                this.scheduleSliceRender();
+            });
+        }
+        if (segOpacitySlider) {
+            segOpacitySlider.addEventListener('input', () => {
+                const value = Math.max(0, Math.min(1, parseFloat(segOpacitySlider.value)));
+                this.setSegmentationState({ overlayOpacity: value });
+                if (segOpacityValue) segOpacityValue.textContent = value.toFixed(2);
+                this.scheduleSliceRender();
+            });
+        }
+        if (segShowOnlyActiveToggle) {
+            segShowOnlyActiveToggle.addEventListener('change', () => {
+                this.setSegmentationState({ showOnlyActive: segShowOnlyActiveToggle.checked });
+            });
+        }
+        if (segDuplicateRoiBtn) {
+            segDuplicateRoiBtn.addEventListener('click', () => {
+                this.duplicateActiveRoi();
+            });
+        }
+        if (segMergeRoiBtn) {
+            segMergeRoiBtn.addEventListener('click', () => {
+                this.mergeRoiIntoActive();
+            });
+        }
+        if (segExportRoiBtn) {
+            segExportRoiBtn.addEventListener('click', () => {
+                void this.exportActiveRoi();
+            });
+        }
+        if (segImportRoiBtn) {
+            segImportRoiBtn.addEventListener('click', () => {
+                if (!this.segRoiImportInput) return;
+                this.segRoiImportInput.value = '';
+                this.segRoiImportInput.click();
+            });
+        }
+        if (segExportSegBtn) {
+            segExportSegBtn.addEventListener('click', () => {
+                this.exportSegmentationPackage();
+            });
+        }
+        if (segImportSegBtn) {
+            segImportSegBtn.addEventListener('click', () => {
+                if (!this.segPackageImportInput) return;
+                this.segPackageImportInput.value = '';
+                this.segPackageImportInput.click();
+            });
+        }
+        if (this.segRoiImportInput) {
+            this.segRoiImportInput.addEventListener('change', () => {
+                const file = this.segRoiImportInput?.files?.[0];
+                if (!file) return;
+                void this.importRoiFromFile(file);
+            });
+        }
+        if (this.segPackageImportInput) {
+            this.segPackageImportInput.addEventListener('change', () => {
+                const file = this.segPackageImportInput?.files?.[0];
+                if (!file) return;
+                void this.importSegmentationPackageFromFile(file);
+            });
+        }
+        if (segPropagateBtn) {
+            segPropagateBtn.addEventListener('click', () => {
+                console.info('Propagation workflow will be added in a later phase.');
+            });
+        }
+        if (segToolBrushBtn) {
+            segToolBrushBtn.addEventListener('click', () => {
+                this.setSegmentationState({ tool: 'brush' });
+            });
+        }
+        if (segToolThresholdBtn) {
+            segToolThresholdBtn.addEventListener('click', () => {
+                this.setSegmentationState({ tool: 'threshold' });
+            });
+        }
+        if (segToolGrowBtn) {
+            segToolGrowBtn.addEventListener('click', () => {
+                this.setSegmentationState({ tool: 'region-grow' });
+            });
+        }
+        if (segBrushDrawBtn) {
+            segBrushDrawBtn.addEventListener('click', () => {
+                this.setSegmentationState({ paintValue: 1 });
+            });
+        }
+        if (segBrushEraseBtn) {
+            segBrushEraseBtn.addEventListener('click', () => {
+                this.setSegmentationState({ paintValue: 0 });
+            });
+        }
+        if (segBrushSize) {
+            segBrushSize.addEventListener('input', () => {
+                const radius = Math.max(1, Math.min(64, parseInt(segBrushSize.value, 10) || 1));
+                this.setSegmentationState({ brushRadius: radius });
+                if (segBrushSizeValue) segBrushSizeValue.textContent = String(radius);
+            });
+        }
+        if (segThresholdMin) {
+            segThresholdMin.addEventListener('change', () => {
+                this.setSegmentationState({ thresholdMin: parseFloat(segThresholdMin.value) || 0 });
+            });
+        }
+        if (segThresholdMax) {
+            segThresholdMax.addEventListener('change', () => {
+                this.setSegmentationState({ thresholdMax: parseFloat(segThresholdMax.value) || 0 });
+            });
+        }
+        if (segGrowTolerance) {
+            segGrowTolerance.addEventListener('change', () => {
+                this.setSegmentationState({ regionGrowTolerance: parseFloat(segGrowTolerance.value) || 0 });
+            });
+        }
+        if (segGrowRadius) {
+            segGrowRadius.addEventListener('change', () => {
+                this.setSegmentationState({ regionGrowSliceRadius: parseInt(segGrowRadius.value, 10) || 0 });
+            });
+        }
+    }
+
+    // ================================================================
+    // Floating overlays (dock/panels)
+    // ================================================================
+
+    private bindOverlayUI(): void {
+        if (this.dockLogoBtn) {
+            this.dockLogoBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.toggleAboutPopover();
+            });
+        }
+
+        if (this.aboutPopover) {
+            this.aboutPopover.addEventListener('mousedown', (e) => e.stopPropagation());
+        }
+
+        if (this.histogramToggleBtn) {
+            this.histogramToggleBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.toggleHistogramOverlay();
+            });
+        }
+
+        if (this.histogramPinBtn) {
+            this.histogramPinBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.toggleHistogramPin();
+            });
+        }
+
+        if (this.histogramOverlay) {
+            this.histogramOverlay.addEventListener('mousedown', (e) => e.stopPropagation());
+        }
+        if (this.segmentationOverlay) {
+            this.segmentationOverlay.addEventListener('mousedown', (e) => e.stopPropagation());
+        }
+        if (this.segmentationPinBtn) {
+            this.segmentationPinBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.setSegmentationState({ isPinned: !this.uiState.state.segmentation.isPinned });
+            });
+        }
+        if (this.segmentationAddRoiBtn) {
+            this.segmentationAddRoiBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.addRoiEntry(true);
+                this.scheduleSliceRender();
+            });
+        }
+        if (this.segmentationSettingsBtn) {
+            this.segmentationSettingsBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                console.info('Use ROI/Segmentation package controls in the panel for import/export.');
+            });
+        }
+        if (this.sliceControls) {
+            this.sliceControls.addEventListener('mousedown', (e) => e.stopPropagation());
+        }
+
+        if (this.viewport3DChip) {
+            this.viewport3DChip.addEventListener('mousedown', (e) => e.stopPropagation());
+            this.viewport3DChip.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.toggle3DPanel();
+            });
+        }
+
+        if (this.viewport3DPanel) {
+            this.viewport3DPanel.addEventListener('mousedown', (e) => e.stopPropagation());
+        }
+
+        document.addEventListener('mousedown', (e) => {
+            const target = e.target as Node | null;
+            if (!target) return;
+
+            if (this.overlayState.aboutOpen &&
+                this.aboutPopover &&
+                !this.aboutPopover.contains(target) &&
+                this.dockLogoBtn &&
+                !this.dockLogoBtn.contains(target)) {
+                this.setAboutOpen(false);
+            }
+
+            if (this.overlayState.histogramOpen &&
+                !this.overlayState.histogramPinned &&
+                this.histogramOverlay &&
+                !this.histogramOverlay.contains(target) &&
+                this.histogramToggleBtn &&
+                !this.histogramToggleBtn.contains(target)) {
+                this.setHistogramOpen(false);
+            }
+
+            if (this.overlayState.threeDPanelOpen &&
+                this.viewport3DControls &&
+                !this.viewport3DControls.contains(target)) {
+                this.set3DPanelOpen(false);
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            if (this.overlayState.aboutOpen) {
+                this.positionAboutPopover();
+            }
+            if (this.overlayState.histogramOpen) {
+                this.refreshHistogramOverlay();
+            }
+            this.clampToolDockPosition();
+            this.updateToolModePanelSide();
+            this.clampHistogramPosition();
+            this.clampSegmentationOverlayPosition();
+            this.clampSliceOverlayPosition();
+            this.update3DStatusChip();
+        });
+
+        this.bindTopOverlayBehavior();
+        this.bind3DOverlayBehavior();
+        this.bindToolDockDrag();
+        this.bindHistogramDrag();
+        this.bindSegmentationOverlayDrag();
+        this.bindSliceOverlayDrag();
+        this.setAboutOpen(false);
+        this.setHistogramOpen(false);
+        this.set3DPanelOpen(false);
+        this.updateSegmentationPanelVisibility();
+        this.update3DStatusChip();
+    }
+
+    private bindTopOverlayBehavior(): void {
+        if (!this.topOverlay) return;
+
+        const showTopOverlay = () => {
+            this.topOverlay!.classList.add('reveal');
+            if (this.overlayState.topOverlayTimer != null) {
+                clearTimeout(this.overlayState.topOverlayTimer);
+            }
+            this.overlayState.topOverlayTimer = window.setTimeout(() => {
+                if (this.topOverlay && !this.topOverlay.matches(':hover')) {
+                    this.topOverlay.classList.remove('reveal');
+                }
+            }, 1500);
+        };
+
+        document.addEventListener('mousemove', (e) => {
+            if (e.clientY <= 72) {
+                showTopOverlay();
+            }
+        });
+
+        this.topOverlay.addEventListener('mouseenter', () => {
+            this.topOverlay!.classList.add('reveal');
+            if (this.overlayState.topOverlayTimer != null) {
+                clearTimeout(this.overlayState.topOverlayTimer);
+            }
+        });
+
+        this.topOverlay.addEventListener('mouseleave', () => {
+            if (this.overlayState.topOverlayTimer != null) {
+                clearTimeout(this.overlayState.topOverlayTimer);
+            }
+            this.overlayState.topOverlayTimer = window.setTimeout(() => {
+                this.topOverlay?.classList.remove('reveal');
+            }, 700);
+        });
+
+        showTopOverlay();
+    }
+
+    private bind3DOverlayBehavior(): void {
+        if (!this.canvas3D || !this.viewport3DControls) return;
+        const viewport3DContainer = this.canvas3D.parentElement;
+        if (!viewport3DContainer) return;
+
+        const activateControls = () => {
+            this.set3DControlsActive(true);
+            this.schedule3DControlsFade();
+        };
+
+        viewport3DContainer.addEventListener('mouseenter', activateControls);
+        viewport3DContainer.addEventListener('mousemove', activateControls);
+        viewport3DContainer.addEventListener('mouseleave', () => {
+            if (!this.overlayState.threeDPanelOpen) {
+                this.set3DControlsActive(false);
+            }
+        });
+
+        this.viewport3DControls.addEventListener('mouseenter', () => {
+            this.set3DControlsActive(true);
+        });
+
+        this.viewport3DControls.addEventListener('mouseleave', () => {
+            if (!this.overlayState.threeDPanelOpen) {
+                this.schedule3DControlsFade();
+            }
+        });
+    }
+
+    private bindToolDockDrag(): void {
+        if (!this.toolDock || !this.toolDockGrip) return;
+
+        let savedLeft = NaN;
+        let savedTop = NaN;
+        try {
+            savedLeft = parseInt(localStorage.getItem('viewerV2.toolDock.left') || '', 10);
+            savedTop = parseInt(localStorage.getItem('viewerV2.toolDock.top') || '', 10);
+        } catch {
+            // Ignore storage read failures.
+        }
+
+        if (Number.isFinite(savedLeft) && Number.isFinite(savedTop)) {
+            this.setToolDockPosition(savedLeft, savedTop, false);
+        } else {
+            this.clampToolDockPosition();
+        }
+
+        const onPointerMove = (e: PointerEvent) => {
+            if (!this.overlayState.toolDockDragging) return;
+            e.preventDefault();
+            const nextLeft = this.overlayState.toolDockStartLeft + (e.clientX - this.overlayState.toolDockStartX);
+            const nextTop = this.overlayState.toolDockStartTop + (e.clientY - this.overlayState.toolDockStartY);
+            this.setToolDockPosition(nextLeft, nextTop, false);
+        };
+
+        const onPointerUp = () => {
+            if (!this.overlayState.toolDockDragging || !this.toolDock) return;
+            this.overlayState.toolDockDragging = false;
+            this.toolDock.classList.remove('dragging');
+            this.persistToolDockPosition();
+            window.removeEventListener('pointermove', onPointerMove);
+            window.removeEventListener('pointerup', onPointerUp);
+            window.removeEventListener('pointercancel', onPointerUp);
+        };
+
+        this.toolDockGrip.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0 || !this.toolDock) return;
+            e.preventDefault();
+            e.stopPropagation();
+
+            const containerRect = this.dropZoneEl.getBoundingClientRect();
+            const dockRect = this.toolDock.getBoundingClientRect();
+            this.overlayState.toolDockDragging = true;
+            this.overlayState.toolDockStartX = e.clientX;
+            this.overlayState.toolDockStartY = e.clientY;
+            this.overlayState.toolDockStartLeft = dockRect.left - containerRect.left;
+            this.overlayState.toolDockStartTop = dockRect.top - containerRect.top;
+
+            this.toolDock.classList.add('dragging');
+            window.addEventListener('pointermove', onPointerMove);
+            window.addEventListener('pointerup', onPointerUp);
+            window.addEventListener('pointercancel', onPointerUp);
+        });
+    }
+
+    private setToolDockPosition(left: number, top: number, persist = true): void {
+        if (!this.toolDock) return;
+
+        const containerRect = this.dropZoneEl.getBoundingClientRect();
+        const dockRect = this.toolDock.getBoundingClientRect();
+        const maxLeft = Math.max(8, containerRect.width - dockRect.width - 8);
+        const maxTop = Math.max(56, containerRect.height - dockRect.height - 8);
+
+        const clampedLeft = Math.max(8, Math.min(maxLeft, left));
+        const clampedTop = Math.max(56, Math.min(maxTop, top));
+
+        this.toolDock.style.left = `${Math.round(clampedLeft)}px`;
+        this.toolDock.style.top = `${Math.round(clampedTop)}px`;
+        this.updateToolModePanelSide();
+
+        if (this.overlayState.aboutOpen) {
+            this.positionAboutPopover();
+        }
+        if (persist) {
+            this.persistToolDockPosition();
+        }
+    }
+
+    private clampToolDockPosition(): void {
+        if (!this.toolDock) return;
+        const left = parseFloat(this.toolDock.style.left || '16');
+        const top = parseFloat(this.toolDock.style.top || '80');
+        this.setToolDockPosition(left, top, false);
+    }
+
+    private persistToolDockPosition(): void {
+        if (!this.toolDock) return;
+        try {
+            localStorage.setItem('viewerV2.toolDock.left', `${Math.round(parseFloat(this.toolDock.style.left || '16'))}`);
+            localStorage.setItem('viewerV2.toolDock.top', `${Math.round(parseFloat(this.toolDock.style.top || '80'))}`);
+        } catch {
+            // Persistence is optional.
+        }
+    }
+
+    private bindHistogramDrag(): void {
+        if (!this.histogramOverlay || !this.histogramGrip) return;
+
+        let savedLeft = NaN;
+        let savedTop = NaN;
+        try {
+            savedLeft = parseInt(localStorage.getItem('viewerV2.histogram.left') || '', 10);
+            savedTop = parseInt(localStorage.getItem('viewerV2.histogram.top') || '', 10);
+        } catch {
+            // Ignore storage read failures.
+        }
+
+        if (Number.isFinite(savedLeft) && Number.isFinite(savedTop)) {
+            this.setHistogramOverlayPosition(savedLeft, savedTop, false);
+        }
+
+        const onPointerMove = (e: PointerEvent) => {
+            if (!this.overlayState.histogramDragging) return;
+            e.preventDefault();
+            const nextLeft = this.overlayState.histogramStartLeft + (e.clientX - this.overlayState.histogramStartX);
+            const nextTop = this.overlayState.histogramStartTop + (e.clientY - this.overlayState.histogramStartY);
+            this.setHistogramOverlayPosition(nextLeft, nextTop, false);
+        };
+
+        const onPointerUp = () => {
+            if (!this.overlayState.histogramDragging || !this.histogramOverlay) return;
+            this.overlayState.histogramDragging = false;
+            this.histogramOverlay.classList.remove('dragging');
+            this.persistHistogramOverlayPosition();
+            window.removeEventListener('pointermove', onPointerMove);
+            window.removeEventListener('pointerup', onPointerUp);
+            window.removeEventListener('pointercancel', onPointerUp);
+        };
+
+        this.histogramGrip.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0 || !this.histogramOverlay) return;
+            e.preventDefault();
+            e.stopPropagation();
+
+            const containerRect = this.dropZoneEl.getBoundingClientRect();
+            const overlayRect = this.histogramOverlay.getBoundingClientRect();
+            this.overlayState.histogramDragging = true;
+            this.overlayState.histogramStartX = e.clientX;
+            this.overlayState.histogramStartY = e.clientY;
+            this.overlayState.histogramStartLeft = overlayRect.left - containerRect.left;
+            this.overlayState.histogramStartTop = overlayRect.top - containerRect.top;
+
+            this.histogramOverlay.classList.add('dragging');
+            window.addEventListener('pointermove', onPointerMove);
+            window.addEventListener('pointerup', onPointerUp);
+            window.addEventListener('pointercancel', onPointerUp);
+        });
+    }
+
+    private setHistogramOverlayPosition(left: number, top: number, persist = true): void {
+        if (!this.histogramOverlay) return;
+
+        const containerRect = this.dropZoneEl.getBoundingClientRect();
+        const panelWidth = this.histogramOverlay.offsetWidth || 260;
+        const panelHeight = this.histogramOverlay.offsetHeight || 170;
+        const maxLeft = Math.max(8, containerRect.width - panelWidth - 8);
+        const maxTop = Math.max(56, containerRect.height - panelHeight - 8);
+
+        const clampedLeft = Math.max(8, Math.min(maxLeft, left));
+        const clampedTop = Math.max(56, Math.min(maxTop, top));
+
+        this.histogramOverlay.style.left = `${Math.round(clampedLeft)}px`;
+        this.histogramOverlay.style.top = `${Math.round(clampedTop)}px`;
+        this.histogramOverlay.style.right = 'auto';
+
+        if (persist) {
+            this.persistHistogramOverlayPosition();
+        }
+    }
+
+    private clampHistogramPosition(): void {
+        if (!this.histogramOverlay || !this.histogramOverlay.style.left) return;
+        const left = parseFloat(this.histogramOverlay.style.left || '0');
+        const top = parseFloat(this.histogramOverlay.style.top || '80');
+        this.setHistogramOverlayPosition(left, top, false);
+    }
+
+    private persistHistogramOverlayPosition(): void {
+        if (!this.histogramOverlay || !this.histogramOverlay.style.left) return;
+        try {
+            localStorage.setItem('viewerV2.histogram.left', `${Math.round(parseFloat(this.histogramOverlay.style.left || '0'))}`);
+            localStorage.setItem('viewerV2.histogram.top', `${Math.round(parseFloat(this.histogramOverlay.style.top || '80'))}`);
+        } catch {
+            // Persistence is optional.
+        }
+    }
+
+    private bindSegmentationOverlayDrag(): void {
+        if (!this.segmentationOverlay || !this.segmentationGrip) return;
+
+        let savedLeft = NaN;
+        let savedTop = NaN;
+        try {
+            savedLeft = parseInt(localStorage.getItem('viewerV2.segmentation.left') || '', 10);
+            savedTop = parseInt(localStorage.getItem('viewerV2.segmentation.top') || '', 10);
+        } catch {
+            // Ignore storage read failures.
+        }
+
+        if (Number.isFinite(savedLeft) && Number.isFinite(savedTop)) {
+            this.setSegmentationOverlayPosition(savedLeft, savedTop, false);
+        }
+
+        const onPointerMove = (e: PointerEvent) => {
+            if (!this.overlayState.segmentationDragging) return;
+            e.preventDefault();
+            const nextLeft = this.overlayState.segmentationStartLeft + (e.clientX - this.overlayState.segmentationStartX);
+            const nextTop = this.overlayState.segmentationStartTop + (e.clientY - this.overlayState.segmentationStartY);
+            this.setSegmentationOverlayPosition(nextLeft, nextTop, false);
+        };
+
+        const onPointerUp = () => {
+            if (!this.overlayState.segmentationDragging || !this.segmentationOverlay) return;
+            this.overlayState.segmentationDragging = false;
+            this.segmentationOverlay.classList.remove('dragging');
+            this.persistSegmentationOverlayPosition();
+            window.removeEventListener('pointermove', onPointerMove);
+            window.removeEventListener('pointerup', onPointerUp);
+            window.removeEventListener('pointercancel', onPointerUp);
+        };
+
+        this.segmentationGrip.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0 || !this.segmentationOverlay) return;
+            e.preventDefault();
+            e.stopPropagation();
+
+            const containerRect = this.dropZoneEl.getBoundingClientRect();
+            const overlayRect = this.segmentationOverlay.getBoundingClientRect();
+            this.overlayState.segmentationDragging = true;
+            this.overlayState.segmentationStartX = e.clientX;
+            this.overlayState.segmentationStartY = e.clientY;
+            this.overlayState.segmentationStartLeft = overlayRect.left - containerRect.left;
+            this.overlayState.segmentationStartTop = overlayRect.top - containerRect.top;
+
+            this.segmentationOverlay.classList.add('dragging');
+            window.addEventListener('pointermove', onPointerMove);
+            window.addEventListener('pointerup', onPointerUp);
+            window.addEventListener('pointercancel', onPointerUp);
+        });
+    }
+
+    private setSegmentationOverlayPosition(left: number, top: number, persist = true): void {
+        if (!this.segmentationOverlay) return;
+
+        const containerRect = this.dropZoneEl.getBoundingClientRect();
+        const panelWidth = this.segmentationOverlay.offsetWidth || 320;
+        const panelHeight = this.segmentationOverlay.offsetHeight || 420;
+        const maxLeft = Math.max(8, containerRect.width - panelWidth - 8);
+        const maxTop = Math.max(56, containerRect.height - panelHeight - 8);
+
+        const clampedLeft = Math.max(8, Math.min(maxLeft, left));
+        const clampedTop = Math.max(56, Math.min(maxTop, top));
+
+        this.segmentationOverlay.style.left = `${Math.round(clampedLeft)}px`;
+        this.segmentationOverlay.style.top = `${Math.round(clampedTop)}px`;
+        this.segmentationOverlay.style.right = 'auto';
+
+        if (persist) {
+            this.persistSegmentationOverlayPosition();
+        }
+    }
+
+    private clampSegmentationOverlayPosition(): void {
+        if (!this.segmentationOverlay || !this.segmentationOverlay.style.left) return;
+        const left = parseFloat(this.segmentationOverlay.style.left || '0');
+        const top = parseFloat(this.segmentationOverlay.style.top || '268');
+        this.setSegmentationOverlayPosition(left, top, false);
+    }
+
+    private persistSegmentationOverlayPosition(): void {
+        if (!this.segmentationOverlay || !this.segmentationOverlay.style.left) return;
+        try {
+            localStorage.setItem('viewerV2.segmentation.left', `${Math.round(parseFloat(this.segmentationOverlay.style.left || '0'))}`);
+            localStorage.setItem('viewerV2.segmentation.top', `${Math.round(parseFloat(this.segmentationOverlay.style.top || '268'))}`);
+        } catch {
+            // Persistence is optional.
+        }
+    }
+
+    private bindSliceOverlayDrag(): void {
+        if (!this.sliceControls || !this.sliceGrip) return;
+
+        let savedLeft = NaN;
+        let savedTop = NaN;
+        try {
+            savedLeft = parseInt(localStorage.getItem('viewerV2.sliceOverlay.left') || '', 10);
+            savedTop = parseInt(localStorage.getItem('viewerV2.sliceOverlay.top') || '', 10);
+        } catch {
+            // Ignore storage read failures.
+        }
+        if (Number.isFinite(savedLeft) && Number.isFinite(savedTop)) {
+            this.setSliceOverlayPosition(savedLeft, savedTop, false);
+        }
+
+        const onPointerMove = (e: PointerEvent) => {
+            if (!this.overlayState.sliceDragging) return;
+            e.preventDefault();
+            const nextLeft = this.overlayState.sliceStartLeft + (e.clientX - this.overlayState.sliceStartX);
+            const nextTop = this.overlayState.sliceStartTop + (e.clientY - this.overlayState.sliceStartY);
+            this.setSliceOverlayPosition(nextLeft, nextTop, false);
+        };
+
+        const onPointerUp = () => {
+            if (!this.overlayState.sliceDragging || !this.sliceControls) return;
+            this.overlayState.sliceDragging = false;
+            this.sliceControls.classList.remove('dragging');
+            this.persistSliceOverlayPosition();
+            window.removeEventListener('pointermove', onPointerMove);
+            window.removeEventListener('pointerup', onPointerUp);
+            window.removeEventListener('pointercancel', onPointerUp);
+        };
+
+        this.sliceGrip.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0 || !this.sliceControls) return;
+            e.preventDefault();
+            e.stopPropagation();
+
+            const containerRect = this.dropZoneEl.getBoundingClientRect();
+            const overlayRect = this.sliceControls.getBoundingClientRect();
+            this.overlayState.sliceDragging = true;
+            this.overlayState.sliceStartX = e.clientX;
+            this.overlayState.sliceStartY = e.clientY;
+            this.overlayState.sliceStartLeft = overlayRect.left - containerRect.left;
+            this.overlayState.sliceStartTop = overlayRect.top - containerRect.top;
+
+            this.sliceControls.classList.add('dragging');
+            window.addEventListener('pointermove', onPointerMove);
+            window.addEventListener('pointerup', onPointerUp);
+            window.addEventListener('pointercancel', onPointerUp);
+        });
+    }
+
+    private setSliceOverlayPosition(left: number, top: number, persist = true): void {
+        if (!this.sliceControls) return;
+
+        const containerRect = this.dropZoneEl.getBoundingClientRect();
+        const panelWidth = this.sliceControls.offsetWidth || 260;
+        const panelHeight = this.sliceControls.offsetHeight || 34;
+        const maxLeft = Math.max(8, containerRect.width - panelWidth - 8);
+        const maxTop = Math.max(8, containerRect.height - panelHeight - 8);
+
+        const clampedLeft = Math.max(8, Math.min(maxLeft, left));
+        const clampedTop = Math.max(8, Math.min(maxTop, top));
+
+        this.sliceControls.style.left = `${Math.round(clampedLeft)}px`;
+        this.sliceControls.style.top = `${Math.round(clampedTop)}px`;
+        this.sliceControls.style.bottom = 'auto';
+        this.sliceControls.style.right = 'auto';
+
+        if (persist) {
+            this.persistSliceOverlayPosition();
+        }
+    }
+
+    private clampSliceOverlayPosition(): void {
+        if (!this.sliceControls || !this.sliceControls.style.left || !this.sliceControls.style.top) return;
+        const left = parseFloat(this.sliceControls.style.left || '16');
+        const top = parseFloat(this.sliceControls.style.top || '16');
+        this.setSliceOverlayPosition(left, top, false);
+    }
+
+    private persistSliceOverlayPosition(): void {
+        if (!this.sliceControls || !this.sliceControls.style.left) return;
+        try {
+            localStorage.setItem('viewerV2.sliceOverlay.left', `${Math.round(parseFloat(this.sliceControls.style.left || '16'))}`);
+            localStorage.setItem('viewerV2.sliceOverlay.top', `${Math.round(parseFloat(this.sliceControls.style.top || '16'))}`);
+        } catch {
+            // Persistence is optional.
+        }
+    }
+
+    private set3DControlsActive(active: boolean): void {
+        if (!this.viewport3DControls) return;
+        this.viewport3DControls.classList.toggle('active', !!active);
+    }
+
+    private schedule3DControlsFade(): void {
+        if (this.overlayState.threeDControlsTimer != null) {
+            clearTimeout(this.overlayState.threeDControlsTimer);
+        }
+        this.overlayState.threeDControlsTimer = window.setTimeout(() => {
+            if (!this.overlayState.threeDPanelOpen) {
+                this.set3DControlsActive(false);
+            }
+        }, 2000);
+    }
+
+    private set3DPanelOpen(open: boolean): void {
+        this.overlayState.threeDPanelOpen = !!open;
+
+        if (this.viewport3DControls) {
+            this.viewport3DControls.classList.toggle('expanded', this.overlayState.threeDPanelOpen);
+        }
+        if (this.viewport3DPanel) {
+            this.viewport3DPanel.setAttribute('aria-hidden', this.overlayState.threeDPanelOpen ? 'false' : 'true');
+        }
+
+        this.set3DControlsActive(true);
+        if (!this.overlayState.threeDPanelOpen) {
+            this.schedule3DControlsFade();
+        }
+    }
+
+    private toggle3DPanel(forceOpen: boolean | null = null): void {
+        const next = forceOpen === null ? !this.overlayState.threeDPanelOpen : !!forceOpen;
+        this.set3DPanelOpen(next);
+    }
+
+    private setAboutOpen(open: boolean): void {
+        this.overlayState.aboutOpen = !!open;
+
+        if (this.aboutPopover) {
+            this.aboutPopover.classList.toggle('open', this.overlayState.aboutOpen);
+            this.aboutPopover.setAttribute('aria-hidden', this.overlayState.aboutOpen ? 'false' : 'true');
+        }
+        if (this.dockLogoBtn) {
+            this.dockLogoBtn.classList.toggle('active', this.overlayState.aboutOpen);
+        }
+        if (this.overlayState.aboutOpen) {
+            this.positionAboutPopover();
+        }
+    }
+
+    private toggleAboutPopover(forceOpen: boolean | null = null): void {
+        const next = forceOpen === null ? !this.overlayState.aboutOpen : !!forceOpen;
+        this.setAboutOpen(next);
+    }
+
+    private positionAboutPopover(): void {
+        if (!this.aboutPopover || !this.toolDock) return;
+
+        const containerRect = this.dropZoneEl.getBoundingClientRect();
+        const dockRect = this.toolDock.getBoundingClientRect();
+        const panelWidth = this.aboutPopover.offsetWidth || 320;
+        const panelHeight = this.aboutPopover.offsetHeight || 164;
+        const gap = 10;
+
+        let left = (dockRect.right - containerRect.left) + gap;
+        let top = dockRect.top - containerRect.top;
+
+        const minLeft = 8;
+        const maxLeft = Math.max(8, containerRect.width - panelWidth - 8);
+        const minTop = 8;
+        const maxTop = Math.max(8, containerRect.height - panelHeight - 8);
+
+        if (left > maxLeft) {
+            left = (dockRect.left - containerRect.left) - panelWidth - gap;
+        }
+
+        const clampedLeft = Math.max(minLeft, Math.min(maxLeft, left));
+        const clampedTop = Math.max(minTop, Math.min(maxTop, top));
+
+        this.aboutPopover.style.left = `${Math.round(clampedLeft)}px`;
+        this.aboutPopover.style.top = `${Math.round(clampedTop)}px`;
+        this.aboutPopover.style.right = 'auto';
+    }
+
+    private setHistogramOpen(open: boolean): void {
+        this.overlayState.histogramOpen = !!open;
+
+        if (this.histogramOverlay) {
+            this.histogramOverlay.classList.toggle('open', this.overlayState.histogramOpen);
+            this.histogramOverlay.setAttribute('aria-hidden', this.overlayState.histogramOpen ? 'false' : 'true');
+        }
+        if (this.histogramToggleBtn) {
+            this.histogramToggleBtn.classList.toggle('active', this.overlayState.histogramOpen);
+        }
+
+        if (!this.overlayState.histogramOpen) {
+            this.overlayState.histogramPinned = false;
+        }
+        this.updateHistogramPinUI();
+
+        if (this.overlayState.histogramOpen) {
+            this.clampHistogramPosition();
+            this.refreshHistogramOverlay();
+        }
+    }
+
+    private toggleHistogramOverlay(forceOpen: boolean | null = null): void {
+        const next = forceOpen === null ? !this.overlayState.histogramOpen : !!forceOpen;
+        this.setHistogramOpen(next);
+    }
+
+    private toggleHistogramPin(): void {
+        if (!this.overlayState.histogramOpen) {
+            this.setHistogramOpen(true);
+        }
+        this.overlayState.histogramPinned = !this.overlayState.histogramPinned;
+        this.updateHistogramPinUI();
+    }
+
+    private updateHistogramPinUI(): void {
+        if (!this.histogramPinBtn) return;
+        this.histogramPinBtn.classList.toggle('active', this.overlayState.histogramPinned);
+        this.histogramPinBtn.setAttribute('title', this.overlayState.histogramPinned ? 'Unpin histogram' : 'Pin histogram');
+    }
+
+    private refreshHistogramOverlay(): void {
+        requestAnimationFrame(() => {
+            this.drawHistogram();
+            this.updateHandlePositions();
+            this.updateHistogramLabels();
+        });
+    }
+
+    private closeTransientOverlays(): boolean {
+        let closed = false;
+
+        if (this.overlayState.aboutOpen) {
+            this.setAboutOpen(false);
+            closed = true;
+        }
+        if (this.overlayState.histogramOpen && !this.overlayState.histogramPinned) {
+            this.setHistogramOpen(false);
+            closed = true;
+        }
+        if (this.overlayState.threeDPanelOpen) {
+            this.set3DPanelOpen(false);
+            closed = true;
+        }
+
+        return closed;
+    }
+
+    private update3DStatusChip(): void {
+        if (!this.resolutionChipText) return;
+
+        let label = '--';
+        let dimsText = '--';
+        const select = document.getElementById('resolution3DSelect') as HTMLSelectElement | null;
+        if (select) {
+            const selected = select.options[select.selectedIndex];
+            if (selected) {
+                const text = (selected.textContent || '').trim();
+                const match = text.match(/^([^(]+)\(([^)]+)\)$/);
+                if (match) {
+                    label = match[1].trim();
+                    dimsText = match[2].trim();
+                } else if (text) {
+                    label = text;
+                }
+            }
+        }
+
+        if (dimsText === '--' && this.volume) {
+            const [nx, ny, nz] = this.volume.dimensions;
+            dimsText = `${nx}x${ny}x${nz}`;
+        }
+
+        this.resolutionChipText.textContent = `Resolution: ${label} - ${dimsText}`;
+        if (this.viewport3DChip) {
+            const lowOrMid = label.toLowerCase() === 'low' || label.toLowerCase() === 'mid';
+            this.viewport3DChip.classList.toggle('alert', lowOrMid);
+        }
     }
 
     // ================================================================
@@ -1344,15 +4231,33 @@ export class ViewerApp {
     private initControls(): void {
         const openBtn = document.getElementById('openBtn')!;
         const resetBtn = document.getElementById('resetBtn')!;
+        const rotateBtn = document.getElementById('rotateBtn');
         const fullscreenBtn = document.getElementById('fullscreenBtn')!;
 
         openBtn.addEventListener('click', () => this.filePicker?.open());
         resetBtn.addEventListener('click', () => this.resetView());
+        if (rotateBtn) rotateBtn.addEventListener('click', () => this.rotateAllViews90());
         fullscreenBtn.addEventListener('click', () => this.toggleFullscreen());
 
         document.addEventListener('keydown', (e) => {
             const tag = (e.target as HTMLElement).tagName;
             if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+            const keyLower = e.key.toLowerCase();
+            const accel = e.ctrlKey || e.metaKey;
+            if (accel && this.isSegmentationMode() && keyLower === 'z') {
+                e.preventDefault();
+                if (e.shiftKey) {
+                    this.redoSegmentationEdit();
+                } else {
+                    this.undoSegmentationEdit();
+                }
+                return;
+            }
+            if (accel && this.isSegmentationMode() && keyLower === 'y') {
+                e.preventDefault();
+                this.redoSegmentationEdit();
+                return;
+            }
 
             switch (e.key) {
                 case 'o':
@@ -1364,8 +4269,17 @@ export class ViewerApp {
                 case 'f':
                     if (!e.ctrlKey && !e.metaKey) { e.preventDefault(); this.toggleFullscreen(); }
                     break;
+                case 't':
+                    if (!e.ctrlKey && !e.metaKey) { e.preventDefault(); this.rotateAllViews90(); }
+                    break;
                 case 'c':
                     if (!e.ctrlKey && !e.metaKey) { e.preventDefault(); this.toggleCrosshairs(); }
+                    break;
+                case 'h':
+                    if (!e.ctrlKey && !e.metaKey) { e.preventDefault(); this.toggleHistogramOverlay(); }
+                    break;
+                case 's':
+                    if (!e.ctrlKey && !e.metaKey) { e.preventDefault(); this.toggleSegmentationMode(); }
                     break;
                 case '+':
                 case '=':
@@ -1413,12 +4327,24 @@ export class ViewerApp {
                     }
                     break;
                 case 'Escape':
-                    if (this.roiMode) {
-                        e.preventDefault();
-                        this.setRoiMode(false);
-                    } else if (this.maximizedView) {
-                        e.preventDefault();
-                        this.toggleMaximize(this.maximizedView);
+                    {
+                        let handled = false;
+                        if (this.closeTransientOverlays()) {
+                            handled = true;
+                        }
+                        if (this.isMeasuringMode()) {
+                            this.setRoiMode(false);
+                            handled = true;
+                        } else if (this.isSegmentationMode()) {
+                            this.setAppMode(AppMode.Viewing);
+                            handled = true;
+                        } else if (this.maximizedView) {
+                            this.toggleMaximize(this.maximizedView);
+                            handled = true;
+                        }
+                        if (handled) {
+                            e.preventDefault();
+                        }
                     }
                     break;
             }
@@ -1469,8 +4395,14 @@ export class ViewerApp {
             // Reset pan on renderers
             for (const axis of AXES) {
                 const r = this.sliceRenderers[axis];
-                if (r) { r.panX = 0; r.panY = 0; r.zoom = 1.0; }
+                if (r) {
+                    r.panX = 0;
+                    r.panY = 0;
+                    r.zoom = 1.0;
+                    r.setRotationQuarter(0);
+                }
             }
+            this.viewRotationQuarter = 0;
 
             // Reset crosshair
             this.crosshairPos = {
@@ -1544,6 +4476,48 @@ export class ViewerApp {
         }
     }
 
+    private rotateAllViews90(): void {
+        this.viewRotationQuarter = (this.viewRotationQuarter + 1) % 4;
+
+        for (const axis of AXES) {
+            this.sliceRenderers[axis]?.setRotationQuarter(this.viewRotationQuarter);
+        }
+
+        if (this.mipRenderer) {
+            this.mipRenderer.roll += 90 * DEG;
+        }
+
+        this.renderAll();
+    }
+
+    private begin3DInteractionQuality(): void {
+        if (!this.mipRenderer) return;
+        if (this.interactionQualityTimer != null) {
+            clearTimeout(this.interactionQualityTimer);
+            this.interactionQualityTimer = null;
+        }
+        if (!this.interactionQualityActive && this.preferred3DQuality !== 'low') {
+            this.interactionQualityActive = true;
+            this.mipRenderer.setQuality('low');
+        }
+    }
+
+    private end3DInteractionQuality(): void {
+        if (!this.mipRenderer) return;
+        if (this.interactionQualityTimer != null) {
+            clearTimeout(this.interactionQualityTimer);
+        }
+        this.interactionQualityTimer = window.setTimeout(() => {
+            this.interactionQualityTimer = null;
+            if (!this.mipRenderer) return;
+            if (this.interactionQualityActive) {
+                this.interactionQualityActive = false;
+                this.mipRenderer.setQuality(this.preferred3DQuality);
+                this.mipRenderer.render();
+            }
+        }, 180);
+    }
+
     // ================================================================
     // Resize
     // ================================================================
@@ -1556,7 +4530,7 @@ export class ViewerApp {
                 if (canvas) {
                     const { width, height } = entry.contentRect;
                     if (canvas === this.canvas3D) {
-                        // 3D canvas: use DPR up to 2×, max 2048px, square aspect
+                        // 3D canvas: use DPR up to 2x, max 2048px, square aspect
                         const dpr = Math.min(window.devicePixelRatio || 1, 2);
                         const size = Math.min(width, height);
                         const targetSize = Math.min(Math.floor(size * dpr), 2048);

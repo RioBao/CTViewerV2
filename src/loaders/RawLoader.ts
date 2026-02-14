@@ -53,8 +53,8 @@ export async function loadRawPreview(rawFile: File, metadataFile: File): Promise
 
 /**
  * Load a RAW file in streaming mode: parse metadata, build a 4x-downsampled
- * preview by streaming through the file (reading every 4th z-slice, sampling
- * every 4th pixel), and return a StreamingVolumeData that reads slices on demand.
+ * preview by streaming through the file using box-filtered block averaging,
+ * and return a StreamingVolumeData that reads slices on demand.
  */
 export async function loadRawStreaming(
     rawFile: File,
@@ -72,9 +72,9 @@ export async function loadRawStreaming(
 }
 
 /**
- * Stream through a RAW file to build a downsampled VolumeData + compute global min/max
+ * Stream through a RAW file to build an anti-aliased downsampled VolumeData + min/max
  * without loading the full file into memory.
- * Reads every `scale`th z-slice, samples every `scale`th pixel in x and y.
+ * Uses box filtering over scale x scale x scale voxel blocks.
  */
 async function downsampleVolumeStreaming(
     file: File,
@@ -94,27 +94,87 @@ async function downsampleVolumeStreaming(
     let globalMin = Infinity;
     let globalMax = -Infinity;
 
-    let di = 0;
-    for (let z = 0; z < nz; z += scale) {
-        const offset = z * sliceBytes;
-        const buf = await file.slice(offset, offset + sliceBytes).arrayBuffer();
-        const sliceData = bufferToTypedArray(buf, metadata.dataType, nx * ny);
+    const xA = new Int32Array(dnx);
+    const xB = new Int32Array(dnx);
+    const xN = new Int32Array(dnx);
+    for (let dx = 0; dx < dnx; dx++) {
+        const x0 = dx * scale;
+        const x1 = Math.min(x0 + scale, nx);
+        const count = x1 - x0;
+        xA[dx] = x0;
+        xB[dx] = count > 1 ? (x1 - 1) : x0;
+        xN[dx] = count > 1 ? 2 : 1;
+    }
+    const yA = new Int32Array(dny);
+    const yB = new Int32Array(dny);
+    const yN = new Int32Array(dny);
+    for (let dy = 0; dy < dny; dy++) {
+        const y0 = dy * scale;
+        const y1 = Math.min(y0 + scale, ny);
+        const count = y1 - y0;
+        yA[dy] = y0;
+        yB[dy] = count > 1 ? (y1 - 1) : y0;
+        yN[dy] = count > 1 ? 2 : 1;
+    }
+    const xySampleCounts = new Int32Array(dnx * dny);
+    for (let dy = 0; dy < dny; dy++) {
+        const row = dy * dnx;
+        for (let dx = 0; dx < dnx; dx++) {
+            xySampleCounts[row + dx] = xN[dx] * yN[dy];
+        }
+    }
 
-        for (let y = 0; y < ny; y += scale) {
-            for (let x = 0; x < nx; x += scale) {
-                const val = sliceData[y * nx + x];
-                downsampled[di++] = val;
-                if (val < globalMin) globalMin = val;
-                if (val > globalMax) globalMax = val;
+    for (let dz = 0; dz < dnz; dz++) {
+        const z0 = dz * scale;
+        const z1 = Math.min(z0 + scale, nz);
+        const zCount = z1 - z0;
+        const zN = zCount > 1 ? 2 : 1;
+        const zFirst = z0;
+        const zLast = zCount > 1 ? (z1 - 1) : z0;
+        const accum = new Float64Array(dnx * dny);
+
+        for (let sz = 0; sz < zN; sz++) {
+            const z = sz === 0 ? zFirst : zLast;
+            const offset = z * sliceBytes;
+            const buf = await file.slice(offset, offset + sliceBytes).arrayBuffer();
+            const sliceData = bufferToTypedArray(buf, metadata.dataType, nx * ny);
+
+            for (let dy = 0; dy < dny; dy++) {
+                const yFirst = yA[dy];
+                const yLast = yB[dy];
+                const yCount = yN[dy];
+                const outRow = dy * dnx;
+
+                for (let dx = 0; dx < dnx; dx++) {
+                    const xFirst = xA[dx];
+                    const xLast = xB[dx];
+                    const xCount = xN[dx];
+                    let sum2D = 0;
+
+                    for (let sy = 0; sy < yCount; sy++) {
+                        const y = sy === 0 ? yFirst : yLast;
+                        const rowOffset = y * nx;
+                        sum2D += sliceData[rowOffset + xFirst];
+                        if (xCount > 1) sum2D += sliceData[rowOffset + xLast];
+                    }
+
+                    accum[outRow + dx] += sum2D;
+                }
             }
         }
 
-        // Report progress
-        const pct = Math.round(((z / scale + 1) / dnz) * 100);
+        const dstZOffset = dz * dnx * dny;
+        for (let i = 0; i < accum.length; i++) {
+            const val = accum[i] / (xySampleCounts[i] * zN);
+            downsampled[dstZOffset + i] = val;
+            if (val < globalMin) globalMin = val;
+            if (val > globalMax) globalMax = val;
+        }
+
+        const pct = Math.round(((dz + 1) / dnz) * 100);
         onProgress?.('Building preview...', pct);
 
-        // Yield to UI every few slices
-        if ((z / scale) % 4 === 0) await new Promise(r => setTimeout(r, 0));
+        if (dz % 2 === 0) await new Promise(r => setTimeout(r, 0));
     }
 
     const downMeta: VolumeMetadata = {
