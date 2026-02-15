@@ -21,10 +21,10 @@ export type VoxelTypedArray = Uint8Array | Uint16Array | Float32Array;
 export type MaskTypedArray = Uint8Array | Uint16Array;
 
 /** Segmentation tool identifier */
-export type SegmentationTool = 'brush' | 'threshold' | 'region-grow';
+export type SegmentationTool = 'brush' | 'threshold' | 'region-grow' | 'smart-region';
 
 /** Segmentation mode tool identifier */
-export type SegmentationModeTool = 'brush' | 'erase' | 'threshold' | 'smart-region' | null;
+export type SegmentationModeTool = 'brush' | 'threshold' | 'region-grow' | 'smart-region' | null;
 
 /** Segmentation UI/runtime settings */
 export interface SegmentationSettings {

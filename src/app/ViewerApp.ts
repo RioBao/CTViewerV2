@@ -7,7 +7,7 @@ import { loadVolume } from '../loaders/VolumeLoader.js';
 import type { VolumeData } from '../data/VolumeData.js';
 import type { StreamingVolumeData } from '../data/StreamingVolumeData.js';
 import { VolumeStore } from '../data/VolumeStore.js';
-import { AppMode, type MaskTypedArray, type SegmentationSettings, type SegmentationTool, type ViewAxis } from '../types.js';
+import { AppMode, type MaskTypedArray, type SegmentationSettings, type ViewAxis } from '../types.js';
 import type { MaskVolume } from '../segmentation/MaskTypes.js';
 import { hexToRgb01, type ROIEntry } from '../segmentation/ROIModel.js';
 import type { SegmentationOp } from '../segmentation/OpsQueue.js';
@@ -172,6 +172,7 @@ export class ViewerApp {
         histogramOpen: false,
         histogramPinned: false,
         aboutOpen: false,
+        footerInfoOpen: false,
         threeDPanelOpen: false,
         toolDockDragging: false,
         toolDockStartX: 0,
@@ -220,16 +221,17 @@ export class ViewerApp {
     private histogramGrip: HTMLElement | null = null;
     private histogramToggleBtn: HTMLElement | null = null;
     private histogramPinBtn: HTMLElement | null = null;
+    private footerInfoPanel: HTMLElement | null = null;
+    private footerInfoGrid: HTMLElement | null = null;
     private segmentationOverlay: HTMLElement | null = null;
     private segmentationGrip: HTMLElement | null = null;
     private segmentationPinBtn: HTMLElement | null = null;
     private segmentationAddRoiBtn: HTMLElement | null = null;
     private segmentationSettingsBtn: HTMLElement | null = null;
     private segRoiList: HTMLElement | null = null;
+    private segToolPalette: HTMLElement | null = null;
     private segModeBtn: HTMLElement | null = null;
     private toolModePanel: HTMLElement | null = null;
-    private toolModeViewing: HTMLElement | null = null;
-    private toolModeMeasuring: HTMLElement | null = null;
     private toolModeSegmentation: HTMLElement | null = null;
     private sliceControls: HTMLElement | null = null;
     private sliceGrip: HTMLElement | null = null;
@@ -286,16 +288,17 @@ export class ViewerApp {
         this.histogramGrip = document.getElementById('histogramGrip');
         this.histogramToggleBtn = document.getElementById('histogramToggleBtn');
         this.histogramPinBtn = document.getElementById('histogramPinBtn');
+        this.footerInfoPanel = document.getElementById('footerInfoPanel');
+        this.footerInfoGrid = document.getElementById('footerInfoGrid');
         this.segmentationOverlay = document.getElementById('segmentationOverlay');
         this.segmentationGrip = document.getElementById('segmentationGrip');
         this.segmentationPinBtn = document.getElementById('segmentationPinBtn');
         this.segmentationAddRoiBtn = document.getElementById('segmentationAddRoiBtn');
         this.segmentationSettingsBtn = document.getElementById('segmentationSettingsBtn');
         this.segRoiList = document.getElementById('segRoiList');
+        this.segToolPalette = document.getElementById('segToolPalette');
         this.segModeBtn = document.getElementById('segModeBtn');
         this.toolModePanel = document.getElementById('toolModePanel');
-        this.toolModeViewing = document.getElementById('toolModeViewing');
-        this.toolModeMeasuring = document.getElementById('toolModeMeasuring');
         this.toolModeSegmentation = document.getElementById('toolModeSegmentation');
         this.sliceControls = document.getElementById('sliceControls');
         this.sliceGrip = document.getElementById('sliceGrip');
@@ -706,28 +709,38 @@ export class ViewerApp {
         if (!this.toolModePanel) return;
         const mode = this.uiState.state.appMode;
         const hasVolume = !!this.volume;
-        this.toolModePanel.classList.toggle('open', hasVolume);
-        this.toolModePanel.setAttribute('aria-hidden', hasVolume ? 'false' : 'true');
-        if (this.toolModeViewing) {
-            this.toolModeViewing.classList.toggle('active', mode === AppMode.Viewing);
+        const showSegToolPalette = hasVolume && mode === AppMode.Segmentation;
+        const showToolModePanel = showSegToolPalette;
+        this.toolModePanel.classList.toggle('open', showToolModePanel);
+        this.toolModePanel.setAttribute('aria-hidden', showToolModePanel ? 'false' : 'true');
+        if (this.toolDock) {
+            this.toolDock.classList.toggle('seg-tools-open', showSegToolPalette);
         }
-        if (this.toolModeMeasuring) {
-            this.toolModeMeasuring.classList.toggle('active', mode === AppMode.Measuring);
+        if (this.segToolPalette) {
+            this.segToolPalette.classList.toggle('open', showSegToolPalette);
+            this.segToolPalette.setAttribute('aria-hidden', showSegToolPalette ? 'false' : 'true');
         }
         if (this.toolModeSegmentation) {
-            this.toolModeSegmentation.classList.toggle('active', mode === AppMode.Segmentation);
+            this.toolModeSegmentation.classList.toggle('active', showToolModePanel);
         }
+        this.updateToolModePanelSide();
     }
 
     private updateToolModePanelSide(): void {
         if (!this.toolDock || !this.toolModePanel) return;
         const containerRect = this.dropZoneEl.getBoundingClientRect();
         const dockRect = this.toolDock.getBoundingClientRect();
-        const panelWidth = Math.max(220, this.toolModePanel.getBoundingClientRect().width || 268);
+        const panelWidth = this.toolModePanel.classList.contains('open')
+            ? Math.max(220, this.toolModePanel.getBoundingClientRect().width || 268)
+            : 0;
+        const segPaletteExtra = (this.segToolPalette && this.segToolPalette.classList.contains('open'))
+            ? Math.max(48, this.segToolPalette.getBoundingClientRect().width || 48) + 20
+            : 0;
+        const requiredWidth = panelWidth + segPaletteExtra;
         const leftInContainer = dockRect.left - containerRect.left;
         const rightSpace = containerRect.width - (leftInContainer + dockRect.width) - 8;
         const leftSpace = leftInContainer - 8;
-        const placeLeft = rightSpace < panelWidth && leftSpace > rightSpace;
+        const placeLeft = rightSpace < requiredWidth && leftSpace > rightSpace;
         this.toolDock.classList.toggle('tool-dock-right', placeLeft);
     }
 
@@ -1071,12 +1084,14 @@ export class ViewerApp {
         const segThresholdMax = document.getElementById('segThresholdMax') as HTMLInputElement | null;
         const segGrowTolerance = document.getElementById('segGrowTolerance') as HTMLInputElement | null;
         const segGrowRadius = document.getElementById('segGrowRadius') as HTMLInputElement | null;
-        const duplicateBtn = document.getElementById('segDuplicateRoiBtn') as HTMLButtonElement | null;
-        const mergeBtn = document.getElementById('segMergeRoiBtn') as HTMLButtonElement | null;
         const exportBtn = document.getElementById('segExportRoiBtn') as HTMLButtonElement | null;
         const importBtn = document.getElementById('segImportRoiBtn') as HTMLButtonElement | null;
         const exportSegBtn = document.getElementById('segExportSegBtn') as HTMLButtonElement | null;
         const importSegBtn = document.getElementById('segImportSegBtn') as HTMLButtonElement | null;
+        const activeNameEl = document.getElementById('segActiveName');
+        const activeClassEl = document.getElementById('segActiveClass');
+        const activeStateEl = document.getElementById('segActiveState');
+        const activeColorEl = document.getElementById('segActiveColor');
         const active = this.getActiveRoi();
 
         if (segEnableToggle) segEnableToggle.checked = seg.enabled;
@@ -1093,15 +1108,25 @@ export class ViewerApp {
         if (this.segmentationPinBtn) {
             this.segmentationPinBtn.classList.toggle('active', seg.isPinned);
         }
-        this.updateSegmentationToolRows(seg.tool);
-        this.updateSegmentationToolButtons(seg.tool);
+        this.updateSegmentationToolRows(seg.activeTool);
+        this.updateSegmentationToolButtons(seg.activeTool);
         this.updateSegmentationBrushButtons(seg.paintValue);
-        if (duplicateBtn) duplicateBtn.disabled = !active;
-        if (mergeBtn) mergeBtn.disabled = !active || this.roiEntries.length < 2;
         if (exportBtn) exportBtn.disabled = !active;
         if (importBtn) importBtn.disabled = !this.volume;
         if (exportSegBtn) exportSegBtn.disabled = !this.volume || !this.maskVolume;
         if (importSegBtn) importSegBtn.disabled = !this.volume;
+
+        if (activeNameEl) activeNameEl.textContent = active ? active.name : 'No active ROI';
+        if (activeClassEl) activeClassEl.textContent = active ? `Class ${active.classId}` : '-';
+        if (activeStateEl) {
+            activeStateEl.textContent = active
+                ? (active.locked ? 'Locked for editing' : 'Ready to edit')
+                : 'Select an ROI to edit.';
+        }
+        if (activeColorEl) {
+            activeColorEl.style.background = active?.colorHex || '#6b7280';
+            activeColorEl.style.opacity = active ? '1' : '0.45';
+        }
 
         this.renderRoiList();
     }
@@ -1181,45 +1206,99 @@ export class ViewerApp {
             const busyTag = document.createElement('span');
             busyTag.className = 'seg-roi-busy';
             busyTag.textContent = roi.aiBusy ? '...' : '';
-            row.append(colorInput, nameInput, visibilityBtn, lockBtn, busyTag);
+
+            const menu = document.createElement('details');
+            menu.className = 'seg-roi-menu';
+            menu.addEventListener('click', (e) => e.stopPropagation());
+
+            const menuSummary = document.createElement('summary');
+            menuSummary.textContent = '...';
+
+            const menuPopover = document.createElement('div');
+            menuPopover.className = 'seg-roi-menu-popover';
+
+            const duplicateBtn = document.createElement('button');
+            duplicateBtn.type = 'button';
+            duplicateBtn.className = 'seg-roi-menu-btn';
+            duplicateBtn.textContent = 'Duplicate ROI';
+            duplicateBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                menu.open = false;
+                this.duplicateRoiById(roi.id);
+            });
+
+            const mergeBtn = document.createElement('button');
+            mergeBtn.type = 'button';
+            mergeBtn.className = 'seg-roi-menu-btn';
+            mergeBtn.textContent = 'Merge Into Active';
+            mergeBtn.disabled = !activeId || activeId === roi.id;
+            mergeBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                menu.open = false;
+                this.mergeRoiIntoActiveById(roi.id);
+            });
+
+            const exportBtn = document.createElement('button');
+            exportBtn.type = 'button';
+            exportBtn.className = 'seg-roi-menu-btn';
+            exportBtn.textContent = 'Export ROI';
+            exportBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                menu.open = false;
+                void this.exportRoiById(roi.id);
+            });
+
+            menuPopover.append(duplicateBtn, mergeBtn, exportBtn);
+            menu.append(menuSummary, menuPopover);
+
+            row.append(colorInput, nameInput, visibilityBtn, lockBtn, busyTag, menu);
             this.segRoiList.appendChild(row);
         }
     }
 
-    private duplicateActiveRoi(): void {
-        const active = this.getActiveRoi();
-        if (!active || !this.maskVolume) return;
+    private duplicateRoiById(sourceRoiId: string): void {
+        const source = this.findRoiById(sourceRoiId);
+        if (!source) return;
         const duplicate = this.addRoiEntry(false);
         if (!duplicate) return;
-        this.invalidateActiveRoiStats();
-        const changed = this.segmentationStore.remapClass(active.classId, duplicate.classId);
-        this.segmentationStore.clearOps();
 
+        duplicate.name = `${source.name} Copy`;
+        duplicate.colorHex = source.colorHex;
+
+        let changed = 0;
+        if (this.maskVolume) {
+            const bits = this.segmentationStore.buildClassMaskBits(source.classId);
+            if (bits) {
+                changed = this.segmentationStore.applyBinaryMaskBitsToClass(duplicate.classId, bits);
+                this.segmentationStore.clearOps();
+            }
+        }
+
+        this.invalidateActiveRoiStats();
         this.setActiveRoi(duplicate.id);
+        this.refreshSegmentationOverlayUI();
         this.scheduleSliceRender();
+        this.scheduleActiveRoiStatsRefresh({ force: true });
+        this.mark3DPaletteDirty();
         if (changed > 0) {
             this.mark3DMaskDirty();
-            this.schedule3DMaskSync({ immediate: true, render: true });
         }
+        this.schedule3DMaskSync({ immediate: true, render: true });
     }
 
-    private mergeRoiIntoActive(): void {
+    private mergeRoiIntoActiveById(sourceRoiId: string): void {
         const active = this.getActiveRoi();
-        if (!active || !this.maskVolume) return;
-        const mergeCandidates = this.roiEntries.filter((roi) => roi.id !== active.id);
-        if (mergeCandidates.length === 0) return;
+        const source = this.findRoiById(sourceRoiId);
+        if (!active || !source || source.id === active.id || !this.maskVolume) return;
 
-        const options = mergeCandidates.map((roi) => `${roi.classId}:${roi.name}`).join(', ');
-        const requested = window.prompt(`Merge class into "${active.name}" (${options})`, `${mergeCandidates[0].classId}`);
-        if (requested == null) return;
-        const classId = parseInt(requested, 10);
-        const source = mergeCandidates.find((roi) => roi.classId === classId);
-        if (!source) return;
         this.invalidateActiveRoiStats();
         const changed = this.segmentationStore.remapClass(source.classId, active.classId);
         this.segmentationStore.clearOps();
-
         this.roiRegistry.removeById(source.id);
+
         this.refreshSegmentationOverlayUI();
         this.scheduleSliceRender();
         this.scheduleActiveRoiStatsRefresh({ force: true });
@@ -1285,21 +1364,21 @@ export class ViewerApp {
             && Array.isArray(payload.rois);
     }
 
-    private async exportActiveRoi(): Promise<void> {
-        const active = this.getActiveRoi();
-        if (!active || !this.maskVolume || !this.volume) return;
+    private async exportRoiById(roiId: string): Promise<void> {
+        const roi = this.findRoiById(roiId);
+        if (!roi || !this.maskVolume || !this.volume) return;
 
-        const bits = this.segmentationStore.buildClassMaskBits(active.classId);
+        const bits = this.segmentationStore.buildClassMaskBits(roi.classId);
         if (!bits) return;
 
-        this.setActiveRoiBusy(active.id, true);
+        this.setActiveRoiBusy(roi.id, true);
         try {
             const encodedMask = await this.segmentationWorker.encodeBinaryMaskRLE({ bits });
             const payload: RoiMaskPayload = {
                 format: 'viewer-roi-mask-v1',
-                name: active.name,
-                colorHex: active.colorHex,
-                classId: active.classId,
+                name: roi.name,
+                colorHex: roi.colorHex,
+                classId: roi.classId,
                 dimensions: this.maskVolume.dimensions,
                 spacing: this.volume.spacing,
                 voxelCount: encodedMask.oneCount,
@@ -1311,13 +1390,19 @@ export class ViewerApp {
                     runs: Array.from(encodedMask.runs),
                 },
             };
-            this.downloadJson(payload, this.sanitizeFileStem(active.name, `roi_${active.classId}`));
+            this.downloadJson(payload, this.sanitizeFileStem(roi.name, `roi_${roi.classId}`));
         } catch (error) {
             console.error('Failed to export ROI:', error);
             window.alert('Failed to export ROI mask.');
         } finally {
-            this.setActiveRoiBusy(active.id, false);
+            this.setActiveRoiBusy(roi.id, false);
         }
+    }
+
+    private async exportActiveRoi(): Promise<void> {
+        const active = this.getActiveRoi();
+        if (!active) return;
+        await this.exportRoiById(active.id);
     }
 
     private async importRoiFromFile(file: File): Promise<void> {
@@ -1538,6 +1623,7 @@ export class ViewerApp {
         this.syncModeButtons();
         this.updateSegmentationPanelVisibility();
         this.updateInteractionCursor();
+        this.refreshFooterInfoDetails();
         this.scheduleActiveRoiStatsRefresh({ force: true });
         this.scheduleSliceRender();
         this.mark3DPaletteDirty();
@@ -1589,10 +1675,13 @@ export class ViewerApp {
 
     private getActiveSegmentationModeTool(seg: SegmentationSettings): SegmentationSettings['activeTool'] {
         if (seg.tool === 'brush') {
-            return seg.paintValue === 0 ? 'erase' : 'brush';
+            return 'brush';
         }
         if (seg.tool === 'threshold') {
             return 'threshold';
+        }
+        if (seg.tool === 'region-grow') {
+            return 'region-grow';
         }
         return 'smart-region';
     }
@@ -1605,19 +1694,17 @@ export class ViewerApp {
 
         if (patch.activeTool !== undefined) {
             switch (patch.activeTool) {
-                case 'erase':
-                    next.tool = 'brush';
-                    next.paintValue = 0;
-                    break;
                 case 'brush':
                     next.tool = 'brush';
-                    next.paintValue = 1;
                     break;
                 case 'threshold':
                     next.tool = 'threshold';
                     break;
-                case 'smart-region':
+                case 'region-grow':
                     next.tool = 'region-grow';
+                    break;
+                case 'smart-region':
+                    next.tool = 'smart-region';
                     break;
                 default:
                     break;
@@ -1657,14 +1744,16 @@ export class ViewerApp {
         next.brushRadius = Math.max(1, Math.min(64, Math.round(next.brushRadius)));
         next.activeClassId = Math.max(1, Math.min(255, Math.round(next.activeClassId)));
         next.regionGrowSliceRadius = Math.max(0, Math.min(MAX_REGION_GROW_SLICE_RADIUS, Math.round(next.regionGrowSliceRadius)));
-        next.activeTool = this.getActiveSegmentationModeTool(next);
+        if (patch.activeTool !== undefined) {
+            next.activeTool = patch.activeTool;
+        } else if (patch.tool !== undefined || patch.paintValue !== undefined) {
+            next.activeTool = this.getActiveSegmentationModeTool(next);
+        }
 
         this.uiState.update({ segmentation: next });
-        if (patch.tool !== undefined || patch.activeTool !== undefined) {
-            this.updateSegmentationToolRows(next.tool);
-            this.updateSegmentationToolButtons(next.tool);
-        }
-        if (patch.paintValue !== undefined || patch.activeTool !== undefined) {
+        if (patch.tool !== undefined || patch.paintValue !== undefined || patch.activeTool !== undefined) {
+            this.updateSegmentationToolRows(next.activeTool);
+            this.updateSegmentationToolButtons(next.activeTool);
             this.updateSegmentationBrushButtons(next.paintValue);
         }
         if (patch.isPinned !== undefined) {
@@ -1839,6 +1928,7 @@ export class ViewerApp {
         // Update 3D resolution dropdown options
         this.update3DResolutionOptions();
         this.update3DStatusChip();
+        this.refreshFooterInfoDetails();
         this.mark3DPaletteDirty();
         this.schedule3DMaskSync({ render: false });
 
@@ -2166,7 +2256,6 @@ export class ViewerApp {
         });
         this.updateSegmentationToolRows('brush');
         this.updateSegmentationToolButtons('brush');
-        this.updateSegmentationBrushButtons(1);
         this.syncModeButtons();
         this.updateSegmentationPanelVisibility();
         this.updateInteractionCursor();
@@ -2195,6 +2284,7 @@ export class ViewerApp {
                     const [w, h, d] = fullInfo.dimensions;
                     this.imageInfoEl.textContent =
                         `${w}x${h}x${d} ${fullInfo.dataType} ${fullInfo.memorySizeMB}MB`;
+                    this.refreshFooterInfoDetails();
                     this.setSegmentationState({
                         thresholdMin: fullVolume.min,
                         thresholdMax: fullVolume.max,
@@ -2223,6 +2313,7 @@ export class ViewerApp {
             const [w, h, d] = info.dimensions;
             this.imageInfoEl.textContent =
                 `${w}x${h}x${d} ${info.dataType} ${info.memorySizeMB}MB${suffix}`;
+            this.refreshFooterInfoDetails();
 
             this.setSegmentationState({
                 thresholdMin: volume.min,
@@ -2235,6 +2326,7 @@ export class ViewerApp {
             const msg = err instanceof Error ? err.message : String(err);
             this.imageInfoEl.textContent = `Error: ${msg}`;
             this.fileNameEl.textContent = name;
+            this.refreshFooterInfoDetails();
             this.showErrorOverlay(msg);
             this.uiState.setLoading(false);
             return;
@@ -2294,15 +2386,21 @@ export class ViewerApp {
     // 2D viewport interactions (pan, zoom, scroll, crosshair, maximize)
     // ================================================================
 
-    private shouldUseBrushTool(): boolean {
+    private shouldUseBrushTool(modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean }): boolean {
         const seg = this.uiState.state.segmentation;
         const active = this.getActiveRoi();
+        const paintValue = this.getEffectiveBrushPaintValue(modifiers);
         return !!this.maskVolume
             && this.isSegmentationMode()
             && seg.enabled
             && seg.tool === 'brush'
-            && !!active
-            && !active.locked;
+            && (paintValue === 0 || (!!active && !active.locked));
+    }
+
+    private getEffectiveBrushPaintValue(modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean }): 0 | 1 {
+        if (modifiers?.shiftKey) return 0;
+        if (modifiers?.ctrlKey || modifiers?.metaKey) return 1;
+        return this.uiState.state.segmentation.paintValue;
     }
 
     private shouldUseThresholdTool(): boolean {
@@ -2380,13 +2478,20 @@ export class ViewerApp {
         return this.applySegmentationOp(op);
     }
 
-    private paintBrushAtClient(axis: ViewAxis, clientX: number, clientY: number): number {
+    private paintBrushAtClient(
+        axis: ViewAxis,
+        clientX: number,
+        clientY: number,
+        modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean },
+    ): number {
         const hit = this.getSliceHitFromClient(axis, clientX, clientY);
         if (!hit) return 0;
         const seg = this.uiState.state.segmentation;
         const active = this.getActiveRoi();
-        if (seg.paintValue !== 0 && (!active || active.locked)) return 0;
-        const classId = seg.paintValue === 0 ? 0 : active!.classId;
+        const dragging = this.segmentationDragging;
+        const paintValue = this.getEffectiveBrushPaintValue(modifiers);
+        if (paintValue !== 0 && (!active || active.locked)) return 0;
+        const classId = paintValue === 0 ? 0 : active!.classId;
         const mergeKey = this.activePaintStrokeId != null ? `paint-stroke:${this.activePaintStrokeId}` : undefined;
         const op = createPaintStrokeOp({
             axis,
@@ -2397,16 +2502,22 @@ export class ViewerApp {
             classId,
             sliceRadius: 0,
             mergeKey,
-            onVoxelChanged: (x, y, z, previousClassId, nextClassId) => {
-                this.applyVoxelChangeToActiveRoiStats(x, y, z, previousClassId, nextClassId);
-            },
+            onVoxelChanged: dragging
+                ? undefined
+                : (x, y, z, previousClassId, nextClassId) => {
+                    this.applyVoxelChangeToActiveRoiStats(x, y, z, previousClassId, nextClassId);
+                },
         });
         const changed = this.applySegmentationOp(op);
         if (changed > 0) {
             this.scheduleAxisRender(axis);
-            this.updatePixelInfo();
-            this.scheduleActiveRoiStatsRefresh();
-            this.schedule3DMaskSync({ render: true });
+            if (dragging) {
+                this.activeRoiStatsDirty = true;
+            } else {
+                this.updatePixelInfo();
+                this.scheduleActiveRoiStatsRefresh();
+                this.schedule3DMaskSync({ render: true });
+            }
         }
         return changed;
     }
@@ -2529,11 +2640,11 @@ export class ViewerApp {
                     return;
                 }
 
-                if (this.shouldUseBrushTool()) {
+                if (this.shouldUseBrushTool(e)) {
                     this.activePaintStrokeId = this.nextPaintStrokeId++;
                     this.segmentationDragging = true;
                     this.segmentationDragAxis = axis;
-                    this.paintBrushAtClient(axis, e.clientX, e.clientY);
+                    this.paintBrushAtClient(axis, e.clientX, e.clientY, e);
                     return;
                 }
                 if (this.shouldUseThresholdTool()) {
@@ -2595,7 +2706,7 @@ export class ViewerApp {
             }
 
             if (this.segmentationDragging && this.segmentationDragAxis) {
-                this.paintBrushAtClient(this.segmentationDragAxis, e.clientX, e.clientY);
+                this.paintBrushAtClient(this.segmentationDragAxis, e.clientX, e.clientY, e);
                 return;
             }
 
@@ -2653,6 +2764,7 @@ export class ViewerApp {
                 this.segmentationDragging = false;
                 this.segmentationDragAxis = null;
                 this.activePaintStrokeId = null;
+                this.updatePixelInfo();
                 this.scheduleActiveRoiStatsRefresh({ force: true });
                 this.schedule3DMaskSync({ immediate: true, render: true });
                 return;
@@ -3152,22 +3264,26 @@ export class ViewerApp {
     // Sidebar controls
     // ================================================================
 
-    private updateSegmentationToolRows(tool: SegmentationTool): void {
+    private updateSegmentationToolRows(activeTool: SegmentationSettings['activeTool']): void {
         const brushRow = document.getElementById('segBrushRow');
         const thresholdRow = document.getElementById('segThresholdRow');
         const growRow = document.getElementById('segGrowRow');
-        if (brushRow) brushRow.style.display = tool === 'brush' ? '' : 'none';
-        if (thresholdRow) thresholdRow.style.display = tool === 'threshold' ? '' : 'none';
-        if (growRow) growRow.style.display = tool === 'region-grow' ? '' : 'none';
+        const aiRow = document.getElementById('segAIRow');
+        if (brushRow) brushRow.style.display = activeTool === 'brush' ? '' : 'none';
+        if (thresholdRow) thresholdRow.style.display = activeTool === 'threshold' ? '' : 'none';
+        if (growRow) growRow.style.display = activeTool === 'region-grow' ? '' : 'none';
+        if (aiRow) aiRow.style.display = activeTool === 'smart-region' ? '' : 'none';
     }
 
-    private updateSegmentationToolButtons(tool: SegmentationTool): void {
+    private updateSegmentationToolButtons(activeTool: SegmentationSettings['activeTool']): void {
         const brushBtn = document.getElementById('segToolBrushBtn');
         const thresholdBtn = document.getElementById('segToolThresholdBtn');
         const growBtn = document.getElementById('segToolGrowBtn');
-        if (brushBtn) brushBtn.classList.toggle('active', tool === 'brush');
-        if (thresholdBtn) thresholdBtn.classList.toggle('active', tool === 'threshold');
-        if (growBtn) growBtn.classList.toggle('active', tool === 'region-grow');
+        const aiBtn = document.getElementById('segToolAIBtn');
+        if (brushBtn) brushBtn.classList.toggle('active', activeTool === 'brush');
+        if (thresholdBtn) thresholdBtn.classList.toggle('active', activeTool === 'threshold');
+        if (growBtn) growBtn.classList.toggle('active', activeTool === 'region-grow');
+        if (aiBtn) aiBtn.classList.toggle('active', activeTool === 'smart-region');
     }
 
     private updateSegmentationBrushButtons(paintValue: 0 | 1): void {
@@ -3298,6 +3414,7 @@ export class ViewerApp {
         const segToolBrushBtn = document.getElementById('segToolBrushBtn') as HTMLButtonElement | null;
         const segToolThresholdBtn = document.getElementById('segToolThresholdBtn') as HTMLButtonElement | null;
         const segToolGrowBtn = document.getElementById('segToolGrowBtn') as HTMLButtonElement | null;
+        const segToolAIBtn = document.getElementById('segToolAIBtn') as HTMLButtonElement | null;
         const segBrushDrawBtn = document.getElementById('segBrushDrawBtn') as HTMLButtonElement | null;
         const segBrushEraseBtn = document.getElementById('segBrushEraseBtn') as HTMLButtonElement | null;
         const segBrushSize = document.getElementById('segBrushSize') as HTMLInputElement | null;
@@ -3307,8 +3424,6 @@ export class ViewerApp {
         const segGrowTolerance = document.getElementById('segGrowTolerance') as HTMLInputElement | null;
         const segGrowRadius = document.getElementById('segGrowRadius') as HTMLInputElement | null;
         const segShowOnlyActiveToggle = document.getElementById('segShowOnlyActiveToggle') as HTMLInputElement | null;
-        const segDuplicateRoiBtn = document.getElementById('segDuplicateRoiBtn') as HTMLButtonElement | null;
-        const segMergeRoiBtn = document.getElementById('segMergeRoiBtn') as HTMLButtonElement | null;
         const segExportRoiBtn = document.getElementById('segExportRoiBtn') as HTMLButtonElement | null;
         const segImportRoiBtn = document.getElementById('segImportRoiBtn') as HTMLButtonElement | null;
         const segExportSegBtn = document.getElementById('segExportSegBtn') as HTMLButtonElement | null;
@@ -3327,9 +3442,8 @@ export class ViewerApp {
         if (segGrowTolerance) segGrowTolerance.value = String(Math.round(seg.regionGrowTolerance));
         if (segGrowRadius) segGrowRadius.value = String(seg.regionGrowSliceRadius);
         if (segShowOnlyActiveToggle) segShowOnlyActiveToggle.checked = seg.showOnlyActive;
-        this.updateSegmentationToolRows(seg.tool);
-        this.updateSegmentationToolButtons(seg.tool);
-        this.updateSegmentationBrushButtons(seg.paintValue);
+        this.updateSegmentationToolRows(seg.activeTool);
+        this.updateSegmentationToolButtons(seg.activeTool);
         this.updateSegmentationPanelVisibility();
 
         if (segEnableToggle) {
@@ -3354,16 +3468,6 @@ export class ViewerApp {
         if (segShowOnlyActiveToggle) {
             segShowOnlyActiveToggle.addEventListener('change', () => {
                 this.setSegmentationState({ showOnlyActive: segShowOnlyActiveToggle.checked });
-            });
-        }
-        if (segDuplicateRoiBtn) {
-            segDuplicateRoiBtn.addEventListener('click', () => {
-                this.duplicateActiveRoi();
-            });
-        }
-        if (segMergeRoiBtn) {
-            segMergeRoiBtn.addEventListener('click', () => {
-                this.mergeRoiIntoActive();
             });
         }
         if (segExportRoiBtn) {
@@ -3411,27 +3515,32 @@ export class ViewerApp {
         }
         if (segToolBrushBtn) {
             segToolBrushBtn.addEventListener('click', () => {
-                this.setSegmentationState({ tool: 'brush' });
+                this.setSegmentationState({ activeTool: 'brush' });
             });
         }
         if (segToolThresholdBtn) {
             segToolThresholdBtn.addEventListener('click', () => {
-                this.setSegmentationState({ tool: 'threshold' });
+                this.setSegmentationState({ activeTool: 'threshold' });
             });
         }
         if (segToolGrowBtn) {
             segToolGrowBtn.addEventListener('click', () => {
-                this.setSegmentationState({ tool: 'region-grow' });
+                this.setSegmentationState({ activeTool: 'region-grow' });
+            });
+        }
+        if (segToolAIBtn) {
+            segToolAIBtn.addEventListener('click', () => {
+                this.setSegmentationState({ activeTool: 'smart-region' });
             });
         }
         if (segBrushDrawBtn) {
             segBrushDrawBtn.addEventListener('click', () => {
-                this.setSegmentationState({ paintValue: 1 });
+                this.setSegmentationState({ tool: 'brush', paintValue: 1, activeTool: 'brush' });
             });
         }
         if (segBrushEraseBtn) {
             segBrushEraseBtn.addEventListener('click', () => {
-                this.setSegmentationState({ paintValue: 0 });
+                this.setSegmentationState({ tool: 'brush', paintValue: 0, activeTool: 'brush' });
             });
         }
         if (segBrushSize) {
@@ -3480,6 +3589,31 @@ export class ViewerApp {
             this.aboutPopover.addEventListener('mousedown', (e) => e.stopPropagation());
         }
 
+        if (this.imageInfoEl) {
+            this.imageInfoEl.classList.add('info-trigger');
+            this.imageInfoEl.setAttribute('tabindex', '0');
+            this.imageInfoEl.setAttribute('role', 'button');
+            this.imageInfoEl.setAttribute('aria-haspopup', 'dialog');
+            this.imageInfoEl.setAttribute('aria-expanded', 'false');
+            this.imageInfoEl.setAttribute('title', 'Show technical details');
+            this.imageInfoEl.addEventListener('mousedown', (e) => e.stopPropagation());
+            this.imageInfoEl.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.toggleFooterInfoPanel();
+            });
+            this.imageInfoEl.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    this.toggleFooterInfoPanel();
+                }
+            });
+        }
+
+        if (this.footerInfoPanel) {
+            this.footerInfoPanel.addEventListener('mousedown', (e) => e.stopPropagation());
+        }
+
         if (this.histogramToggleBtn) {
             this.histogramToggleBtn.addEventListener('click', (e) => {
                 e.preventDefault();
@@ -3502,6 +3636,9 @@ export class ViewerApp {
         if (this.segmentationOverlay) {
             this.segmentationOverlay.addEventListener('mousedown', (e) => e.stopPropagation());
         }
+        if (this.segToolPalette) {
+            this.segToolPalette.addEventListener('mousedown', (e) => e.stopPropagation());
+        }
         if (this.segmentationPinBtn) {
             this.segmentationPinBtn.addEventListener('click', (e) => {
                 e.preventDefault();
@@ -3521,7 +3658,9 @@ export class ViewerApp {
             this.segmentationSettingsBtn.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                console.info('Use ROI/Segmentation package controls in the panel for import/export.');
+                const advanced = document.getElementById('segAdvancedControls') as HTMLDetailsElement | null;
+                if (!advanced) return;
+                advanced.open = !advanced.open;
             });
         }
         if (this.sliceControls) {
@@ -3567,6 +3706,14 @@ export class ViewerApp {
                 !this.viewport3DControls.contains(target)) {
                 this.set3DPanelOpen(false);
             }
+
+            if (this.overlayState.footerInfoOpen &&
+                this.footerInfoPanel &&
+                !this.footerInfoPanel.contains(target) &&
+                this.imageInfoEl &&
+                !this.imageInfoEl.contains(target)) {
+                this.setFooterInfoOpen(false);
+            }
         });
 
         window.addEventListener('resize', () => {
@@ -3582,6 +3729,9 @@ export class ViewerApp {
             this.clampSegmentationOverlayPosition();
             this.clampSliceOverlayPosition();
             this.update3DStatusChip();
+            if (this.overlayState.footerInfoOpen) {
+                this.refreshFooterInfoDetails();
+            }
         });
 
         this.bindTopOverlayBehavior();
@@ -3593,6 +3743,7 @@ export class ViewerApp {
         this.setAboutOpen(false);
         this.setHistogramOpen(false);
         this.set3DPanelOpen(false);
+        this.setFooterInfoOpen(false);
         this.updateSegmentationPanelVisibility();
         this.update3DStatusChip();
     }
@@ -4095,6 +4246,100 @@ export class ViewerApp {
         this.setAboutOpen(next);
     }
 
+    private setFooterInfoOpen(open: boolean): void {
+        this.overlayState.footerInfoOpen = !!open;
+
+        if (this.footerInfoPanel) {
+            this.footerInfoPanel.classList.toggle('open', this.overlayState.footerInfoOpen);
+            this.footerInfoPanel.setAttribute('aria-hidden', this.overlayState.footerInfoOpen ? 'false' : 'true');
+        }
+        if (this.imageInfoEl) {
+            this.imageInfoEl.classList.toggle('active', this.overlayState.footerInfoOpen);
+            this.imageInfoEl.setAttribute('aria-expanded', this.overlayState.footerInfoOpen ? 'true' : 'false');
+        }
+        if (this.overlayState.footerInfoOpen) {
+            this.refreshFooterInfoDetails();
+        }
+    }
+
+    private toggleFooterInfoPanel(forceOpen: boolean | null = null): void {
+        const next = forceOpen === null ? !this.overlayState.footerInfoOpen : !!forceOpen;
+        this.setFooterInfoOpen(next);
+    }
+
+    private refreshFooterInfoDetails(): void {
+        if (!this.footerInfoGrid) return;
+        const volume = this.volume;
+        if (!volume) {
+            this.footerInfoGrid.innerHTML = '<span class="footer-info-label">Status</span><span class="footer-info-value">No volume loaded</span>';
+            return;
+        }
+
+        const info = volume.getInfo();
+        const [nx, ny, nz] = info.dimensions;
+        const [sx, sy, sz] = info.spacing;
+        const mode = this.uiState.state.appMode;
+        const modeLabel = mode === AppMode.Segmentation
+            ? 'Segmentation'
+            : mode === AppMode.Measuring
+                ? 'Measuring'
+                : 'Viewing';
+        const streamingLabel = volume.isStreaming ? 'Yes' : 'No';
+        const memoryLabel = `${info.memorySizeMB} MB`;
+        const bytesLabel = this.formatBytes(this.estimateVolumeBytes(info.dimensions, info.dataType));
+        const voxelCount = nx * ny * nz;
+        const spacingLabel = `${this.formatNumeric(sx, 3)} x ${this.formatNumeric(sy, 3)} x ${this.formatNumeric(sz, 3)}`;
+
+        this.footerInfoGrid.innerHTML = `
+            <span class="footer-info-label">Dimensions</span><span class="footer-info-value">${nx} x ${ny} x ${nz}</span>
+            <span class="footer-info-label">Voxel Count</span><span class="footer-info-value">${this.formatNumeric(voxelCount, 0)}</span>
+            <span class="footer-info-label">Spacing</span><span class="footer-info-value">${spacingLabel}</span>
+            <span class="footer-info-label">Type</span><span class="footer-info-value">${info.dataType}</span>
+            <span class="footer-info-label">Memory</span><span class="footer-info-value">${memoryLabel} (${bytesLabel})</span>
+            <span class="footer-info-label">Intensity</span><span class="footer-info-value">${this.formatNumeric(volume.min, 2)} to ${this.formatNumeric(volume.max, 2)}</span>
+            <span class="footer-info-label">Streaming</span><span class="footer-info-value">${streamingLabel}</span>
+            <span class="footer-info-label">Mode</span><span class="footer-info-value">${modeLabel}</span>
+        `;
+    }
+
+    private formatBytes(bytes: number): string {
+        if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let size = bytes;
+        let unitIndex = 0;
+        while (size >= 1024 && unitIndex < units.length - 1) {
+            size /= 1024;
+            unitIndex++;
+        }
+        const digits = size >= 100 || unitIndex === 0 ? 0 : size >= 10 ? 1 : 2;
+        return `${size.toFixed(digits)} ${units[unitIndex]}`;
+    }
+
+    private estimateVolumeBytes(dimensions: [number, number, number], dataType: string): number {
+        const [nx, ny, nz] = dimensions;
+        const bytesPerVoxel = this.bytesPerVoxel(dataType);
+        return nx * ny * nz * bytesPerVoxel;
+    }
+
+    private bytesPerVoxel(dataType: string): number {
+        switch (dataType.toLowerCase()) {
+            case 'uint8':
+            case 'int8':
+                return 1;
+            case 'uint16':
+            case 'int16':
+                return 2;
+            case 'uint32':
+            case 'int32':
+            case 'float32':
+                return 4;
+            case 'float64':
+                return 8;
+            default:
+                return 1;
+        }
+    }
+
     private positionAboutPopover(): void {
         if (!this.aboutPopover || !this.toolDock) return;
 
@@ -4186,6 +4431,10 @@ export class ViewerApp {
         }
         if (this.overlayState.threeDPanelOpen) {
             this.set3DPanelOpen(false);
+            closed = true;
+        }
+        if (this.overlayState.footerInfoOpen) {
+            this.setFooterInfoOpen(false);
             closed = true;
         }
 

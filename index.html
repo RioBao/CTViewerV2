@@ -1,9 +1,12 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CTViewer WebGPU</title>
+    <title>VXL RT</title>
+    <meta name="application-name" content="VXL RT">
+    <meta name="apple-mobile-web-app-title" content="VXL RT">
+    <link rel="icon" type="image/png" href="./icon/dock-logo3.png">
 </head>
 <body>
     <div class="container">
@@ -41,8 +44,8 @@
                 </div>
 
                 <div class="tool-dock" id="toolDock">
-                    <button id="dockLogoBtn" class="dock-logo-wrap dock-logo-btn" title="CTViewer WebGPU" aria-label="CTViewer WebGPU">
-                        <span class="dock-logo">V2</span>
+                    <button id="dockLogoBtn" class="dock-logo-wrap dock-logo-btn" title="VXL RT - Real-time volume viewer" aria-label="VXL RT - Real-time volume viewer">
+                        <img src="./icon/dock-logo3.png" alt="" class="dock-logo" draggable="false">
                     </button>
                     <div class="dock-grip" id="toolDockGrip" title="Drag tool dock">::</div>
                     <button id="zoomInBtn" class="dock-btn" title="Zoom In (+)" aria-label="Zoom In">
@@ -94,29 +97,55 @@
                         </svg>
                     </button>
 
+                    <div class="seg-tool-palette" id="segToolPalette" aria-hidden="true">
+                        <button type="button" id="segToolBrushBtn" class="dock-btn seg-tool-btn active" title="Brush" aria-label="Brush">
+                            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M3 21l3-1 9-9-2-2-9 9-1 3z"></path>
+                                <path d="M13 7l2 2"></path>
+                            </svg>
+                        </button>
+                        <button type="button" id="segToolThresholdBtn" class="dock-btn seg-tool-btn" title="Threshold" aria-label="Threshold">
+                            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M4 18h16"></path>
+                                <path d="M7 18V10"></path>
+                                <path d="M12 18V6"></path>
+                                <path d="M17 18v-4"></path>
+                            </svg>
+                        </button>
+                        <button type="button" id="segToolGrowBtn" class="dock-btn seg-tool-btn" title="Region Grow" aria-label="Region Grow">
+                            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <circle cx="8" cy="8" r="2"></circle>
+                                <circle cx="16" cy="8" r="2"></circle>
+                                <circle cx="12" cy="16" r="2"></circle>
+                                <path d="M9.5 9.5l2 4"></path>
+                                <path d="M14.5 9.5l-2 4"></path>
+                            </svg>
+                        </button>
+                        <button type="button" id="segToolAIBtn" class="dock-btn seg-tool-btn" title="AI Smart Region" aria-label="AI Smart Region">
+                            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M12 3l1.8 4.2L18 9l-4.2 1.8L12 15l-1.8-4.2L6 9l4.2-1.8z"></path>
+                                <path d="M18 14l.9 2.1L21 17l-2.1.9L18 20l-.9-2.1L15 17l2.1-.9z"></path>
+                            </svg>
+                        </button>
+                    </div>
+
                     <div class="tool-mode-panel" id="toolModePanel" aria-hidden="true">
-                        <div class="tool-mode-view" id="toolModeViewing">
-                            <div class="tool-mode-title">Viewing</div>
-                            <div class="tool-mode-hint">Navigate with pan, zoom, histogram, and crosshair.</div>
-                        </div>
-                        <div class="tool-mode-view" id="toolModeMeasuring">
-                            <div class="tool-mode-title">Measuring</div>
-                            <div class="tool-mode-hint">Drag on a slice to create a rectangular measurement ROI.</div>
-                        </div>
                         <div class="tool-mode-view" id="toolModeSegmentation">
-                            <div class="tool-mode-title">Segmentation Tools</div>
-                            <div class="control-row">
-                                <div class="seg-tool-buttons">
-                                    <button type="button" id="segToolBrushBtn" class="seg-tool-button active">Brush</button>
-                                    <button type="button" id="segToolThresholdBtn" class="seg-tool-button">Threshold</button>
-                                    <button type="button" id="segToolGrowBtn" class="seg-tool-button">Region Grow</button>
-                                </div>
-                            </div>
+                            <div class="tool-mode-title">Tool Parameters</div>
                             <div class="control-row" id="segBrushRow">
                                 <label>Brush Action</label>
                                 <div class="seg-tool-buttons two-col">
-                                    <button type="button" id="segBrushDrawBtn" class="seg-tool-button active">Draw</button>
-                                    <button type="button" id="segBrushEraseBtn" class="seg-tool-button">Erase</button>
+                                    <button type="button" id="segBrushDrawBtn" class="seg-tool-button seg-icon-only active" title="Draw" aria-label="Draw">
+                                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                            <path d="M3 21l3-1 9-9-2-2-9 9-1 3z"></path>
+                                            <path d="M13 7l2 2"></path>
+                                        </svg>
+                                    </button>
+                                    <button type="button" id="segBrushEraseBtn" class="seg-tool-button seg-icon-only" title="Erase" aria-label="Erase">
+                                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                            <path d="M3 14l6 6h8l4-4-10-10z"></path>
+                                        </svg>
+                                    </button>
                                 </div>
                                 <label for="segBrushSize">Brush Size <span id="segBrushSizeValue">8</span></label>
                                 <input type="range" id="segBrushSize" min="1" max="64" step="1" value="8">
@@ -133,15 +162,18 @@
                                 <label for="segGrowRadius">Slice Radius (2.5D)</label>
                                 <input type="number" id="segGrowRadius" min="0" max="2" step="1" value="1">
                             </div>
+                            <div class="control-row" id="segAIRow" style="display: none;">
+                                <span>AI Smart Region preview controls will appear here.</span>
+                            </div>
                         </div>
                     </div>
                 </div>
 
-                <div class="about-popover" id="aboutPopover" aria-hidden="true" role="dialog" aria-label="About CTViewer WebGPU">
-                    <div class="about-title">CTViewer WebGPU</div>
-                    <div class="about-subtitle">High-performance browser volume rendering</div>
-                    <p class="about-body">A GPU-accelerated volume viewer with streaming data support, interactive multi-planar slices, and modern floating controls.</p>
-                    <div class="about-footer">WebGPU · MIP Raymarching · Streaming 3D Volumes</div>
+                <div class="about-popover" id="aboutPopover" aria-hidden="true" role="dialog" aria-label="About VXL RT">
+                    <div class="about-title">VXL RT</div>
+                    <div class="about-subtitle">Real-time browser volume viewer</div>
+                    <p class="about-body">A GPU-accelerated volume viewer for streaming CT data, interactive multi-planar slices, and segmentation workflows.</p>
+                    <div class="about-footer">WebGPU &middot; MIP Raymarching &middot; Streaming 3D Volumes</div>
                 </div>
 
                 <div class="image-wrapper" id="imageWrapper">
@@ -152,17 +184,17 @@
 
                     <div id="ct3DView" class="ct-view" style="display: none;">
                         <div class="viewport-container" data-axis="xy">
-                            <span class="viewport-label">XY (Axial)</span>
+                            <span class="viewport-label">XY</span>
                             <span class="lowres-indicator" id="lowresXY">LOW-RES</span>
                             <canvas id="canvasXY" class="viewport-canvas"></canvas>
                         </div>
                         <div class="viewport-container" data-axis="xz">
-                            <span class="viewport-label">XZ (Coronal)</span>
+                            <span class="viewport-label">XZ</span>
                             <span class="lowres-indicator" id="lowresXZ">LOW-RES</span>
                             <canvas id="canvasXZ" class="viewport-canvas"></canvas>
                         </div>
                         <div class="viewport-container" data-axis="yz">
-                            <span class="viewport-label">YZ (Sagittal)</span>
+                            <span class="viewport-label">YZ</span>
                             <span class="lowres-indicator" id="lowresYZ">LOW-RES</span>
                             <canvas id="canvasYZ" class="viewport-canvas"></canvas>
                         </div>
@@ -270,57 +302,33 @@
 
                         <div class="seg-overlay-body">
                             <div class="seg-section">
-                                <div class="seg-section-title">Mode</div>
-                                <div class="control-row">
-                                    <label><input type="checkbox" id="segEnableToggle"> Enable Editing</label>
-                                </div>
-                                <div class="control-row">
-                                    <label><input type="checkbox" id="segVisibleToggle" checked> Show Overlay</label>
-                                </div>
-                            </div>
-
-                            <div class="seg-section">
-                                <div class="seg-section-title">Tools</div>
-                                <div class="control-row">
-                                    <span>Tool controls are in the left mode panel while segmentation mode is active.</span>
-                                </div>
-                            </div>
-
-                            <div class="seg-section">
                                 <div class="seg-section-title">ROI List</div>
                                 <div class="seg-roi-list" id="segRoiList"></div>
                             </div>
 
                             <div class="seg-section">
-                                <div class="seg-section-title">ROI Management</div>
-                                <div class="seg-action-grid">
-                                    <button id="segDuplicateRoiBtn" class="seg-action-btn" type="button">Duplicate ROI</button>
-                                    <button id="segMergeRoiBtn" class="seg-action-btn" type="button">Merge ROI</button>
-                                    <button id="segExportRoiBtn" class="seg-action-btn" type="button">Export ROI</button>
-                                    <button id="segImportRoiBtn" class="seg-action-btn" type="button">Import ROI</button>
+                                <div class="seg-section-title">Active ROI Summary</div>
+                                <div class="seg-active-summary">
+                                    <div class="seg-active-row">
+                                        <span class="seg-active-color" id="segActiveColor"></span>
+                                        <span class="seg-active-name" id="segActiveName">No active ROI</span>
+                                        <span class="seg-active-class" id="segActiveClass">-</span>
+                                    </div>
+                                    <div class="seg-active-state" id="segActiveState">Select an ROI to edit.</div>
+                                    <div class="seg-stats-grid">
+                                        <span>Voxels</span><span id="segStatsVoxels">-</span>
+                                        <span>Volume</span><span id="segStatsVolume">-</span>
+                                        <span>Mean Intensity</span><span id="segStatsMean">-</span>
+                                        <span>Std Dev</span><span id="segStatsStd">-</span>
+                                    </div>
                                 </div>
                             </div>
 
                             <div class="seg-section">
-                                <div class="seg-section-title">Segmentation Package</div>
-                                <div class="seg-action-grid">
-                                    <button id="segExportSegBtn" class="seg-action-btn" type="button">Export Segmentation</button>
-                                    <button id="segImportSegBtn" class="seg-action-btn" type="button">Import Segmentation</button>
+                                <div class="seg-section-title">Display Controls</div>
+                                <div class="control-row">
+                                    <label><input type="checkbox" id="segVisibleToggle" checked> Show Overlay</label>
                                 </div>
-                            </div>
-
-                            <div class="seg-section">
-                                <div class="seg-section-title">Active ROI Stats</div>
-                                <div class="seg-stats-grid">
-                                    <span>Voxels</span><span id="segStatsVoxels">-</span>
-                                    <span>Volume</span><span id="segStatsVolume">-</span>
-                                    <span>Mean Intensity</span><span id="segStatsMean">-</span>
-                                    <span>Std Dev</span><span id="segStatsStd">-</span>
-                                </div>
-                            </div>
-
-                            <div class="seg-section">
-                                <div class="seg-section-title">Display</div>
                                 <div class="control-row">
                                     <label><input type="checkbox" id="segShowOnlyActiveToggle"> Show only active ROI</label>
                                 </div>
@@ -331,7 +339,21 @@
                             </div>
 
                             <div class="seg-section">
-                                <button id="segPropagateBtn" class="seg-action-btn" type="button">Propagate...</button>
+                                <details class="seg-advanced-controls" id="segAdvancedControls">
+                                    <summary class="seg-advanced-toggle">Advanced Controls</summary>
+                                    <div class="seg-advanced-body">
+                                        <div class="control-row">
+                                            <label><input type="checkbox" id="segEnableToggle"> Enable Editing</label>
+                                        </div>
+                                        <div class="seg-action-grid">
+                                            <button id="segExportRoiBtn" class="seg-action-btn" type="button">Export Active ROI</button>
+                                            <button id="segImportRoiBtn" class="seg-action-btn" type="button">Import ROI</button>
+                                            <button id="segExportSegBtn" class="seg-action-btn" type="button">Export Segmentation</button>
+                                            <button id="segImportSegBtn" class="seg-action-btn" type="button">Import Segmentation</button>
+                                        </div>
+                                        <button id="segPropagateBtn" class="seg-action-btn" type="button">Propagate...</button>
+                                    </div>
+                                </details>
                             </div>
                         </div>
                     </div>
@@ -354,6 +376,10 @@
             <span id="imageInfo"></span>
             <span id="zoomLevel">100%</span>
         </div>
+        <div class="footer-info-panel" id="footerInfoPanel" aria-hidden="true" role="dialog" aria-label="Technical Dataset Details">
+            <div class="footer-info-title">Technical Details</div>
+            <div class="footer-info-grid" id="footerInfoGrid"></div>
+        </div>
     </div>
 
     <div id="webgpu-error" class="webgpu-error" style="display: none;">
@@ -369,3 +395,4 @@
     <script type="module" src="/src/main.ts"></script>
 </body>
 </html>
+

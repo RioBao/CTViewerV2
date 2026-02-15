@@ -535,7 +535,7 @@ export class MIPRenderer {
         const pass = encoder.beginRenderPass({
             colorAttachments: [{
                 view: textureView,
-                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                clearValue: { r: 0.039, g: 0.051, b: 0.075, a: 1 },
                 loadOp: 'clear',
                 storeOp: 'store',
             }],
@@ -549,14 +549,14 @@ export class MIPRenderer {
         device.queue.submit([encoder.finish()]);
     }
 
-    /** Clear to black */
+    /** Clear to the 3D viewport background tone */
     clear(): void {
         if (this.gpu.isLost) return;
         const encoder = this.gpu.device.createCommandEncoder();
         const pass = encoder.beginRenderPass({
             colorAttachments: [{
                 view: this.ctx.getCurrentTexture().createView(),
-                clearValue: { r: 0.1, g: 0.1, b: 0.1, a: 1 },
+                clearValue: { r: 0.039, g: 0.051, b: 0.075, a: 1 },
                 loadOp: 'clear',
                 storeOp: 'store',
             }],
