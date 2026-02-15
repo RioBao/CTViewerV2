@@ -574,7 +574,7 @@ export class ViewerApp {
         }
 
         const lookup = this.getMask3DLookup(mask.dimensions, targetDims);
-        const classCounts = new Uint16Array(256);
+        const classCounts = new Uint32Array(256);
         const touchedClasses = new Uint8Array(256);
         let touchedCount = 0;
 
