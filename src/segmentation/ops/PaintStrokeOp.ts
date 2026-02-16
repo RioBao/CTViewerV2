@@ -10,8 +10,9 @@ interface VoxelDelta {
     after: number;
 }
 
-function voxelKey(x: number, y: number, z: number): string {
-    return `${x},${y},${z}`;
+/** Numeric key for (x,y,z) — unique for volumes up to 65536 per axis. */
+function voxelKey(x: number, y: number, z: number): number {
+    return (z * 65536 + y) * 65536 + x;
 }
 
 export interface PaintStrokeOpParams {
@@ -31,7 +32,7 @@ class PaintStrokeOp implements SegmentationOp {
     readonly mergeKey?: string;
     private committed = false;
     private deltas: VoxelDelta[] = [];
-    private deltaIndex = new Map<string, number>();
+    private deltaIndex = new Map<number, number>();
     private onVoxelChanged?: PaintStrokeOpParams['onVoxelChanged'];
 
     private readonly axis: ViewAxis;

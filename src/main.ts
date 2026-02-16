@@ -9,3 +9,10 @@ app.initialize().catch((err) => {
     if (errorDiv) errorDiv.style.display = 'flex';
     if (container) container.style.display = 'none';
 });
+
+// Vite HMR: dispose old instance so event listeners don't leak
+if (import.meta.hot) {
+    import.meta.hot.dispose(() => {
+        app.dispose();
+    });
+}

@@ -49,7 +49,11 @@ interface PendingTask<T> {
     resolve: (result: unknown) => void;
     reject: (reason: Error) => void;
     parse: (response: WorkerSuccessResponse) => T;
+    timer: ReturnType<typeof setTimeout>;
 }
+
+/** Maximum time (ms) to wait for a worker response before rejecting. */
+const WORKER_TASK_TIMEOUT_MS = 60_000;
 
 /**
  * Small RPC client for segmentation heavy ops (threshold, region-grow).
@@ -65,6 +69,7 @@ export class SegmentationWorkerClient {
             const response = event.data;
             const task = this.pending.get(response.id);
             if (!task) return;
+            clearTimeout(task.timer);
             this.pending.delete(response.id);
             if (!response.ok) {
                 task.reject(new Error(response.error));
@@ -79,6 +84,7 @@ export class SegmentationWorkerClient {
         this.worker.onerror = (event) => {
             const error = new Error(event.message || 'Segmentation worker failure');
             for (const [, task] of this.pending) {
+                clearTimeout(task.timer);
                 task.reject(error);
             }
             this.pending.clear();
@@ -101,10 +107,17 @@ export class SegmentationWorkerClient {
     ): Promise<T> {
         const id = request.id;
         return new Promise<T>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                const task = this.pending.get(id);
+                if (!task) return;
+                this.pending.delete(id);
+                task.reject(new Error(`Segmentation worker task ${id} timed out after ${WORKER_TASK_TIMEOUT_MS}ms`));
+            }, WORKER_TASK_TIMEOUT_MS);
             this.pending.set(id, {
                 resolve: (value) => resolve(value as T),
                 reject,
                 parse,
+                timer,
             });
             this.worker.postMessage(request, transfer);
         });
@@ -211,6 +224,7 @@ export class SegmentationWorkerClient {
     dispose(): void {
         this.worker.terminate();
         for (const [, task] of this.pending) {
+            clearTimeout(task.timer);
             task.reject(new Error('Segmentation worker disposed'));
         }
         this.pending.clear();

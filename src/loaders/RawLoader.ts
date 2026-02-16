@@ -345,7 +345,16 @@ function validateMetadata(m: VolumeMetadata): void {
 
 // ---- Binary loading ----
 
+/** Browser ArrayBuffer limit — 2 GiB minus 1 byte. */
+const MAX_ARRAY_BUFFER_BYTES = 2 * 1024 * 1024 * 1024 - 1;
+
 async function loadBinary(file: File, onProgress?: (pct: number) => void): Promise<ArrayBuffer> {
+    if (file.size > MAX_ARRAY_BUFFER_BYTES) {
+        throw new Error(
+            `File is too large for in-memory loading (${(file.size / (1024 ** 3)).toFixed(2)} GB). ` +
+            `Browser ArrayBuffer limit is 2 GB. Use streaming mode for files this large.`,
+        );
+    }
     if (file.size > CHUNK_THRESHOLD) {
         return loadChunked(file, onProgress);
     }

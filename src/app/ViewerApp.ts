@@ -21,7 +21,7 @@ import type { BinaryMaskRLEJson } from '../segmentation/MaskPersistence.js';
 const DEG = Math.PI / 180;
 const AXES: ViewAxis[] = ['xy', 'xz', 'yz'];
 type QualityPreset = 'low' | 'medium' | 'high';
-const MAX_REGION_GROW_SLICE_RADIUS = 2;
+const MAX_SEGMENTATION_SLICE_RADIUS = 10;
 const ACTIVE_ROI_STATS_DEBOUNCE_MS = 220;
 const ACTIVE_ROI_STATS_CHUNK_TARGET_VOXELS = 1_200_000;
 const BRICK_SIZE = 8;
@@ -96,6 +96,10 @@ export class ViewerApp {
     private uiState = new UIState();
     private filePicker: FilePicker | null = null;
     private volumeStore = new VolumeStore();
+    /** Tracks the volume that started a 3D resolution change; used to detect stale async results. */
+    private resolution3DVolumeToken: object | null = null;
+    /** AbortController for all persistent window/document event listeners. */
+    private readonly globalAbort = new AbortController();
     private segmentationStore = new SegmentationStore(512);
     private roiRegistry = new ROIRegistry();
     private maskSliceBuffers: Record<ViewAxis, MaskTypedArray | null> = { xy: null, xz: null, yz: null };
@@ -362,7 +366,15 @@ export class ViewerApp {
         this.initResizeObservers();
         this.updateToolModePanel();
         this.updateToolModePanelSide();
-        window.addEventListener('beforeunload', () => this.segmentationWorker.dispose());
+        window.addEventListener('beforeunload', () => this.segmentationWorker.dispose(), { signal: this.globalAbort.signal });
+    }
+
+    /** Tear down all persistent event listeners and owned resources. */
+    dispose(): void {
+        this.globalAbort.abort();
+        this.segmentationWorker.dispose();
+        this.segmentationStore.clearMask();
+        this.volumeStore.clear({ disposeStreaming: true, resetResolution: true });
     }
 
     // ================================================================
@@ -1083,7 +1095,7 @@ export class ViewerApp {
         const segThresholdMin = document.getElementById('segThresholdMin') as HTMLInputElement | null;
         const segThresholdMax = document.getElementById('segThresholdMax') as HTMLInputElement | null;
         const segGrowTolerance = document.getElementById('segGrowTolerance') as HTMLInputElement | null;
-        const segGrowRadius = document.getElementById('segGrowRadius') as HTMLInputElement | null;
+        const segSliceRadius = document.getElementById('segSliceRadius') as HTMLInputElement | null;
         const exportBtn = document.getElementById('segExportRoiBtn') as HTMLButtonElement | null;
         const importBtn = document.getElementById('segImportRoiBtn') as HTMLButtonElement | null;
         const exportSegBtn = document.getElementById('segExportSegBtn') as HTMLButtonElement | null;
@@ -1104,7 +1116,7 @@ export class ViewerApp {
         if (segThresholdMin) segThresholdMin.value = String(Math.round(seg.thresholdMin));
         if (segThresholdMax) segThresholdMax.value = String(Math.round(seg.thresholdMax));
         if (segGrowTolerance) segGrowTolerance.value = String(Math.round(seg.regionGrowTolerance));
-        if (segGrowRadius) segGrowRadius.value = String(seg.regionGrowSliceRadius);
+        if (segSliceRadius) segSliceRadius.value = String(seg.regionGrowSliceRadius);
         if (this.segmentationPinBtn) {
             this.segmentationPinBtn.classList.toggle('active', seg.isPinned);
         }
@@ -1743,7 +1755,7 @@ export class ViewerApp {
         next.overlayOpacity = Math.max(0, Math.min(1, next.overlayOpacity));
         next.brushRadius = Math.max(1, Math.min(64, Math.round(next.brushRadius)));
         next.activeClassId = Math.max(1, Math.min(255, Math.round(next.activeClassId)));
-        next.regionGrowSliceRadius = Math.max(0, Math.min(MAX_REGION_GROW_SLICE_RADIUS, Math.round(next.regionGrowSliceRadius)));
+        next.regionGrowSliceRadius = Math.max(0, Math.min(MAX_SEGMENTATION_SLICE_RADIUS, Math.round(next.regionGrowSliceRadius)));
         if (patch.activeTool !== undefined) {
             next.activeTool = patch.activeTool;
         } else if (patch.tool !== undefined || patch.paintValue !== undefined) {
@@ -1906,9 +1918,11 @@ export class ViewerApp {
         }
 
         // Compute histogram (from MIP volume, which is always in-memory)
-        this.computeHistogram(mipVolume);
-        this.drawHistogram();
-        this.updateHandlePositions();
+        this.computeHistogram(mipVolume).then(() => {
+            if (this.volume !== volume) return;
+            this.drawHistogram();
+            this.updateHandlePositions();
+        });
 
         // Show floating controls once a volume is loaded
         const sliceControls = document.getElementById('sliceControls');
@@ -2042,6 +2056,10 @@ export class ViewerApp {
     private async set3DResolution(value: 'low' | 'mid' | 'full'): Promise<void> {
         if (!this.volume || !this.mipRenderer) return;
 
+        // Token used to detect if the volume changed while awaiting async work.
+        const volumeToken = this.volume;
+        this.resolution3DVolumeToken = volumeToken;
+
         const select = document.getElementById('resolution3DSelect') as HTMLSelectElement | null;
         const status = document.getElementById('resolution3DStatus');
 
@@ -2049,7 +2067,13 @@ export class ViewerApp {
         const savedMin = this.mipRenderer.displayMin;
         const savedMax = this.mipRenderer.displayMax;
 
+        /** Returns false if the volume changed during an async gap — the caller should abort. */
+        const isStale = (): boolean => {
+            return this.resolution3DVolumeToken !== volumeToken || this.volume !== volumeToken;
+        };
+
         const uploadAndRender = (vol: VolumeData): boolean => {
+            if (isStale()) return false;
             if (!this.canUploadVolumeTo3D(vol)) {
                 this.set3DStatusText('Volume too large for GPU memory');
                 return false;
@@ -2080,13 +2104,21 @@ export class ViewerApp {
             if (status) status.textContent = '';
         };
 
+        const revertSelect = () => {
+            if (select) {
+                select.disabled = false;
+                select.value = this.current3DResolution;
+            }
+            clearStatus();
+            this.update3DStatusChip();
+        };
+
         try {
             if (value === 'low') {
                 if (this.volume.isStreaming) {
                     // Streaming: getMIPVolume() is the 4x downsampled lowRes
                     if (!uploadAndRender(this.volume.getMIPVolume())) {
-                        if (select) select.value = this.current3DResolution;
-                        this.update3DStatusChip();
+                        revertSelect();
                         return;
                     }
                 } else {
@@ -2094,28 +2126,26 @@ export class ViewerApp {
                     const cached = this.volumeStore.getCached3DVolume('low');
                     if (cached) {
                         if (!uploadAndRender(cached)) {
-                            if (select) select.value = this.current3DResolution;
-                            this.update3DStatusChip();
+                            revertSelect();
                             return;
                         }
                     } else {
                         if (select) select.disabled = true;
                         if (status) status.textContent = '0%';
                         const lowVol = await (this.volume as VolumeData).createDownsampledVolume(4, (pct) => {
-                            if (status) status.textContent = `${pct}%`;
+                            if (!isStale() && status) status.textContent = `${pct}%`;
                         });
+                        if (isStale()) { revertSelect(); return; }
                         if (select) select.disabled = false;
                         clearStatus();
                         if (lowVol) {
                             this.volumeStore.cache3DVolume('low', lowVol);
                             if (!uploadAndRender(lowVol)) {
-                                if (select) select.value = this.current3DResolution;
-                                this.update3DStatusChip();
+                                revertSelect();
                                 return;
                             }
                         } else {
-                            if (select) select.value = this.current3DResolution;
-                            this.update3DStatusChip();
+                            revertSelect();
                             return;
                         }
                     }
@@ -2126,33 +2156,30 @@ export class ViewerApp {
                 const cached = this.volumeStore.getCached3DVolume('mid');
                 if (cached) {
                     if (!uploadAndRender(cached)) {
-                        if (select) select.value = this.current3DResolution;
-                        this.update3DStatusChip();
+                        revertSelect();
                         return;
                     }
                 } else {
                     if (!this.volume.canEnhance3D()) {
-                        if (select) select.value = this.current3DResolution;
-                        this.update3DStatusChip();
+                        revertSelect();
                         return;
                     }
                     if (select) select.disabled = true;
                     if (status) status.textContent = '0%';
                     const midVol = await this.volume.createDownsampledVolume(2, (pct) => {
-                        if (status) status.textContent = `${pct}%`;
+                        if (!isStale() && status) status.textContent = `${pct}%`;
                     });
+                    if (isStale()) { revertSelect(); return; }
                     if (select) select.disabled = false;
                     clearStatus();
                     if (midVol) {
                         this.volumeStore.cache3DVolume('mid', midVol);
                         if (!uploadAndRender(midVol)) {
-                            if (select) select.value = this.current3DResolution;
-                            this.update3DStatusChip();
+                            revertSelect();
                             return;
                         }
                     } else {
-                        if (select) select.value = this.current3DResolution;
-                        this.update3DStatusChip();
+                        revertSelect();
                         return;
                     }
                 }
@@ -2160,13 +2187,11 @@ export class ViewerApp {
 
             } else if (value === 'full') {
                 if (this.volume.isStreaming) {
-                    if (select) select.value = this.current3DResolution;
-                    this.update3DStatusChip();
+                    revertSelect();
                     return;
                 }
                 if (!uploadAndRender(this.volume as VolumeData)) {
-                    if (select) select.value = this.current3DResolution;
-                    this.update3DStatusChip();
+                    revertSelect();
                     return;
                 }
                 this.current3DResolution = 'full';
@@ -2174,12 +2199,7 @@ export class ViewerApp {
             this.update3DStatusChip();
         } catch (error) {
             console.error('Failed to set 3D resolution:', error);
-            if (select) {
-                select.disabled = false;
-                select.value = this.current3DResolution;
-            }
-            clearStatus();
-            this.update3DStatusChip();
+            revertSelect();
         }
     }
 
@@ -2216,6 +2236,7 @@ export class ViewerApp {
         // Reset 3D resolution cache for new volume
         this.clear3DMaskSyncTimer();
         this.mask3DSyncWantsRender = false;
+        this.resolution3DVolumeToken = null; // Invalidate any in-flight resolution change
         this.volumeStore.clear({ disposeStreaming: true, resetResolution: true });
         this.segmentationStore.clearMask();
         this.maskSliceBuffers = { xy: null, xz: null, yz: null };
@@ -2478,6 +2499,17 @@ export class ViewerApp {
         return this.applySegmentationOp(op);
     }
 
+    private getSliceIndicesWithRadius(axis: ViewAxis, centerSlice: number, radius: number): number[] {
+        const clampedRadius = Math.max(0, Math.min(MAX_SEGMENTATION_SLICE_RADIUS, Math.floor(radius)));
+        const minSlice = Math.max(0, centerSlice - clampedRadius);
+        const maxSlice = Math.min(this.maxSlice(axis), centerSlice + clampedRadius);
+        const slices: number[] = [];
+        for (let slice = minSlice; slice <= maxSlice; slice++) {
+            slices.push(slice);
+        }
+        return slices;
+    }
+
     private paintBrushAtClient(
         axis: ViewAxis,
         clientX: number,
@@ -2500,7 +2532,7 @@ export class ViewerApp {
             sliceY: hit.sliceY,
             radius: seg.brushRadius,
             classId,
-            sliceRadius: 0,
+            sliceRadius: seg.regionGrowSliceRadius,
             mergeKey,
             onVoxelChanged: dragging
                 ? undefined
@@ -2532,17 +2564,21 @@ export class ViewerApp {
         this.segmentationWorkerBusy = true;
         this.setActiveRoiBusy(active.id, true);
         try {
-            const slice = this.volume.getSlice(axis, hit.sliceIndex);
-            const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
-            const selected = await this.segmentationWorker.runThresholdSlice({
-                width: slice.width,
-                height: slice.height,
-                values,
-                min: Math.min(seg.thresholdMin, seg.thresholdMax),
-                max: Math.max(seg.thresholdMin, seg.thresholdMax),
-            });
-            const changed = this.applySelectionIndicesToActiveRoi(axis, hit.sliceIndex, slice.width, slice.height, selected);
-            if (changed > 0) {
+            const targetSlices = this.getSliceIndicesWithRadius(axis, hit.sliceIndex, seg.regionGrowSliceRadius);
+            let changedTotal = 0;
+            for (const sliceIndex of targetSlices) {
+                const slice = this.volume.getSlice(axis, sliceIndex);
+                const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
+                const selected = await this.segmentationWorker.runThresholdSlice({
+                    width: slice.width,
+                    height: slice.height,
+                    values,
+                    min: Math.min(seg.thresholdMin, seg.thresholdMax),
+                    max: Math.max(seg.thresholdMin, seg.thresholdMax),
+                });
+                changedTotal += this.applySelectionIndicesToActiveRoi(axis, sliceIndex, slice.width, slice.height, selected);
+            }
+            if (changedTotal > 0) {
                 this.invalidateActiveRoiStats();
                 this.scheduleAxisRender(axis);
                 this.scheduleActiveRoiStatsRefresh({ force: true });
@@ -2567,20 +2603,24 @@ export class ViewerApp {
         this.segmentationWorkerBusy = true;
         this.setActiveRoiBusy(active.id, true);
         try {
-            const slice = this.volume.getSlice(axis, hit.sliceIndex);
-            const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
-            const sx = Math.max(0, Math.min(slice.width - 1, Math.floor(hit.sliceX)));
-            const sy = Math.max(0, Math.min(slice.height - 1, Math.floor(hit.sliceY)));
-            const seedIndex = sy * slice.width + sx;
-            const selected = await this.segmentationWorker.runRegionGrowSlice({
-                width: slice.width,
-                height: slice.height,
-                values,
-                seedIndex,
-                tolerance: Math.max(0, seg.regionGrowTolerance),
-            });
-            const changed = this.applySelectionIndicesToActiveRoi(axis, hit.sliceIndex, slice.width, slice.height, selected);
-            if (changed > 0) {
+            const targetSlices = this.getSliceIndicesWithRadius(axis, hit.sliceIndex, seg.regionGrowSliceRadius);
+            let changedTotal = 0;
+            for (const sliceIndex of targetSlices) {
+                const slice = this.volume.getSlice(axis, sliceIndex);
+                const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
+                const sx = Math.max(0, Math.min(slice.width - 1, Math.floor(hit.sliceX)));
+                const sy = Math.max(0, Math.min(slice.height - 1, Math.floor(hit.sliceY)));
+                const seedIndex = sy * slice.width + sx;
+                const selected = await this.segmentationWorker.runRegionGrowSlice({
+                    width: slice.width,
+                    height: slice.height,
+                    values,
+                    seedIndex,
+                    tolerance: Math.max(0, seg.regionGrowTolerance),
+                });
+                changedTotal += this.applySelectionIndicesToActiveRoi(axis, sliceIndex, slice.width, slice.height, selected);
+            }
+            if (changedTotal > 0) {
                 this.invalidateActiveRoiStats();
                 this.scheduleAxisRender(axis);
                 this.scheduleActiveRoiStatsRefresh({ force: true });
@@ -2748,7 +2788,7 @@ export class ViewerApp {
                     this.scheduleSliceRender();
                 }
             }
-        });
+        }, { signal: this.globalAbort.signal });
 
         window.addEventListener('mouseup', (e) => {
             // ROI release
@@ -2786,7 +2826,7 @@ export class ViewerApp {
             }
 
             this.slice2DDragAxis = null;
-        });
+        }, { signal: this.globalAbort.signal });
     }
 
     // ================================================================
@@ -3006,7 +3046,7 @@ export class ViewerApp {
     // Histogram
     // ================================================================
 
-    private computeHistogram(volume: VolumeData): void {
+    private async computeHistogram(volume: VolumeData): Promise<void> {
         const bins = new Array(256).fill(0);
         const data = volume.data;
         const min = volume.min;
@@ -3016,9 +3056,18 @@ export class ViewerApp {
             return;
         }
 
-        for (let i = 0; i < data.length; i++) {
-            const bin = Math.floor(((data[i] - min) / range) * 255);
-            bins[Math.max(0, Math.min(255, bin))]++;
+        const CHUNK = 1_000_000;
+        for (let start = 0; start < data.length; start += CHUNK) {
+            const end = Math.min(start + CHUNK, data.length);
+            for (let i = start; i < end; i++) {
+                const bin = Math.floor(((data[i] - min) / range) * 255);
+                bins[Math.max(0, Math.min(255, bin))]++;
+            }
+            if (start + CHUNK < data.length) {
+                await new Promise<void>(r => setTimeout(r, 0));
+                // Volume may have changed while yielded
+                if (this.volume !== volume) return;
+            }
         }
         this.histogramBins = bins;
     }
@@ -3120,11 +3169,11 @@ export class ViewerApp {
             }
 
             this.applyWindow(this.displayWindowMin, this.displayWindowMax);
-        });
+        }, { signal: this.globalAbort.signal });
 
         window.addEventListener('mouseup', () => {
             this.histDragging = null;
-        });
+        }, { signal: this.globalAbort.signal });
     }
 
     private applyWindow(min: number, max: number): void {
@@ -3231,7 +3280,7 @@ export class ViewerApp {
             this.mipRenderer.elevation -= dy * 0.5 * DEG;
 
             this.mipRenderer.render();
-        });
+        }, { signal: this.globalAbort.signal });
 
         window.addEventListener('mouseup', () => {
             if (dragging) {
@@ -3239,7 +3288,7 @@ export class ViewerApp {
                 canvas.style.cursor = 'grab';
                 this.end3DInteractionQuality();
             }
-        });
+        }, { signal: this.globalAbort.signal });
 
         canvas.addEventListener('wheel', (e) => {
             if (!this.mipRenderer || !this.volume) return;
@@ -3422,7 +3471,7 @@ export class ViewerApp {
         const segThresholdMin = document.getElementById('segThresholdMin') as HTMLInputElement | null;
         const segThresholdMax = document.getElementById('segThresholdMax') as HTMLInputElement | null;
         const segGrowTolerance = document.getElementById('segGrowTolerance') as HTMLInputElement | null;
-        const segGrowRadius = document.getElementById('segGrowRadius') as HTMLInputElement | null;
+        const segSliceRadius = document.getElementById('segSliceRadius') as HTMLInputElement | null;
         const segShowOnlyActiveToggle = document.getElementById('segShowOnlyActiveToggle') as HTMLInputElement | null;
         const segExportRoiBtn = document.getElementById('segExportRoiBtn') as HTMLButtonElement | null;
         const segImportRoiBtn = document.getElementById('segImportRoiBtn') as HTMLButtonElement | null;
@@ -3440,7 +3489,7 @@ export class ViewerApp {
         if (segThresholdMin) segThresholdMin.value = String(Math.round(seg.thresholdMin));
         if (segThresholdMax) segThresholdMax.value = String(Math.round(seg.thresholdMax));
         if (segGrowTolerance) segGrowTolerance.value = String(Math.round(seg.regionGrowTolerance));
-        if (segGrowRadius) segGrowRadius.value = String(seg.regionGrowSliceRadius);
+        if (segSliceRadius) segSliceRadius.value = String(seg.regionGrowSliceRadius);
         if (segShowOnlyActiveToggle) segShowOnlyActiveToggle.checked = seg.showOnlyActive;
         this.updateSegmentationToolRows(seg.activeTool);
         this.updateSegmentationToolButtons(seg.activeTool);
@@ -3565,9 +3614,9 @@ export class ViewerApp {
                 this.setSegmentationState({ regionGrowTolerance: parseFloat(segGrowTolerance.value) || 0 });
             });
         }
-        if (segGrowRadius) {
-            segGrowRadius.addEventListener('change', () => {
-                this.setSegmentationState({ regionGrowSliceRadius: parseInt(segGrowRadius.value, 10) || 0 });
+        if (segSliceRadius) {
+            segSliceRadius.addEventListener('change', () => {
+                this.setSegmentationState({ regionGrowSliceRadius: parseInt(segSliceRadius.value, 10) || 0 });
             });
         }
     }
@@ -3714,7 +3763,7 @@ export class ViewerApp {
                 !this.imageInfoEl.contains(target)) {
                 this.setFooterInfoOpen(false);
             }
-        });
+        }, { signal: this.globalAbort.signal });
 
         window.addEventListener('resize', () => {
             if (this.overlayState.aboutOpen) {
@@ -3732,7 +3781,7 @@ export class ViewerApp {
             if (this.overlayState.footerInfoOpen) {
                 this.refreshFooterInfoDetails();
             }
-        });
+        }, { signal: this.globalAbort.signal });
 
         this.bindTopOverlayBehavior();
         this.bind3DOverlayBehavior();
@@ -3767,7 +3816,7 @@ export class ViewerApp {
             if (e.clientY <= 72) {
                 showTopOverlay();
             }
-        });
+        }, { signal: this.globalAbort.signal });
 
         this.topOverlay.addEventListener('mouseenter', () => {
             this.topOverlay!.classList.add('reveal');
@@ -4597,7 +4646,7 @@ export class ViewerApp {
                     }
                     break;
             }
-        });
+        }, { signal: this.globalAbort.signal });
     }
 
     private navigateSlice(axis: ViewAxis, delta: number): void {

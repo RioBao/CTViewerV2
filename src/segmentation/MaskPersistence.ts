@@ -154,6 +154,11 @@ export function decodeBinaryMaskBitsRLE(input: {
         write += length;
         bit = bit === 1 ? 0 : 1;
     }
+    if (write !== total) {
+        throw new Error(
+            `Binary RLE decode mismatch: runs sum to ${write} but totalVoxels is ${total}`,
+        );
+    }
     return out;
 }
 
@@ -242,6 +247,11 @@ export function decodeLabelValuesRLE(
         if (length <= 0) continue;
         out.fill(value, write, Math.min(total, write + length));
         write += length;
+    }
+    if (write !== total) {
+        throw new Error(
+            `Label RLE decode mismatch: runs sum to ${write} but totalVoxels is ${total}`,
+        );
     }
     return out;
 }

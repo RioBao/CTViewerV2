@@ -61,14 +61,24 @@ export class SegmentationStore {
             return false;
         }
 
-        this._maskVolume?.dispose();
-        this._maskVolume = createMaskVolume(dimensions, {
-            classDataType: options.classDataType ?? 'uint8',
-            preferredBackend: options.preferredBackend ?? 'auto',
-            maxDenseVoxels: options.maxDenseVoxels,
-            chunkSize: options.chunkSize,
-        });
+        const oldMask = this._maskVolume;
+        this._maskVolume = null;
         this.opsQueue.clear();
+
+        try {
+            this._maskVolume = createMaskVolume(dimensions, {
+                classDataType: options.classDataType ?? 'uint8',
+                preferredBackend: options.preferredBackend ?? 'auto',
+                maxDenseVoxels: options.maxDenseVoxels,
+                chunkSize: options.chunkSize,
+            });
+        } catch (e) {
+            this._maskVolume = null;
+            oldMask?.dispose();
+            throw e;
+        }
+
+        oldMask?.dispose();
         return true;
     }
 

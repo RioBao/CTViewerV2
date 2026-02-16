@@ -240,6 +240,10 @@ export class StreamingVolumeData {
         this.currentXZIndex = -1;
         this.currentYZIndex = -1;
         this.onSliceReady = null;
+        // Release large retained objects so GC can reclaim them even if
+        // pending promise chains still reference `this`.
+        (this as unknown as { file: File | null }).file = null;
+        (this as unknown as { lowRes: VolumeData | null }).lowRes = null;
     }
 
     // ========================================================================
