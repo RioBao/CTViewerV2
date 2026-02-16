@@ -250,6 +250,7 @@ export class SliceRenderer {
         const device = this.gpu.device;
         const cw = this.canvas.width;
         const ch = this.canvas.height;
+        if (cw <= 0 || ch <= 0) return;
 
         // Update uniforms
         const uniforms = new Float32Array([
@@ -303,6 +304,7 @@ export class SliceRenderer {
     /** Clear the canvas to black */
     clear(): void {
         if (this.gpu.isLost) return;
+        if (this.canvas.width <= 0 || this.canvas.height <= 0) return;
         const encoder = this.gpu.device.createCommandEncoder();
         const pass = encoder.beginRenderPass({
             colorAttachments: [{

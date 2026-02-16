@@ -14,6 +14,7 @@ import type { SegmentationOp } from '../segmentation/OpsQueue.js';
 import { createPaintStrokeOp } from '../segmentation/ops/PaintStrokeOp.js';
 import { createApplySliceSelectionOp } from '../segmentation/ops/ApplySliceSelectionOp.js';
 import { SegmentationWorkerClient } from '../segmentation/SegmentationWorkerClient.js';
+import { SegmentationGpuCompute } from '../segmentation/SegmentationGpuCompute.js';
 import { ROIRegistry } from '../segmentation/ROIRegistry.js';
 import { SegmentationStore, type SegmentationTilesSnapshot } from '../segmentation/SegmentationStore.js';
 import type { BinaryMaskRLEJson } from '../segmentation/MaskPersistence.js';
@@ -28,6 +29,7 @@ const BRICK_SIZE = 8;
 const MAX_SAFE_3D_UPLOAD_BYTES = 384 * 1024 * 1024; // 384 MB conservative budget
 const MASK_3D_SYNC_IDLE_MS = 48;
 const MASK_3D_SYNC_DRAG_MS = 140;
+const REGION_GROW_GPU_DISABLE_AFTER_MS = 900;
 
 interface ActiveRoiStatsAccumulator {
     roiId: string;
@@ -87,6 +89,24 @@ interface Mask3DLookupCache {
     conservative: boolean;
 }
 
+type RegionGrowBackend = 'webgpu' | 'worker';
+
+interface RegionGrowSliceResult {
+    selected: Uint32Array;
+    backend: RegionGrowBackend;
+    elapsedMs: number;
+}
+
+interface RegionGrowPerfStats {
+    slices: number;
+    selected: number;
+    elapsedMs: number;
+}
+
+function createRegionGrowPerfStats(): RegionGrowPerfStats {
+    return { slices: 0, selected: 0, elapsedMs: 0 };
+}
+
 /**
  * Top-level application orchestrator.
  * Manages WebGPU renderers, user interaction, histogram, and crosshairs.
@@ -121,6 +141,12 @@ export class ViewerApp {
     private mask3DLabelBuffer: Uint8Array | null = null;
     private mask3DLookupCache: Mask3DLookupCache | null = null;
     private segmentationWorker = new SegmentationWorkerClient();
+    private segmentationGpuCompute: SegmentationGpuCompute | null = null;
+    private segmentationGpuComputeFailed = false;
+    private regionGrowPerfTotals: Record<RegionGrowBackend, RegionGrowPerfStats> = {
+        webgpu: createRegionGrowPerfStats(),
+        worker: createRegionGrowPerfStats(),
+    };
     private segmentationWorkerBusy = false;
     private activePaintStrokeId: number | null = null;
     private nextPaintStrokeId = 1;
@@ -342,6 +368,14 @@ export class ViewerApp {
                 this.sliceRenderers[axis] = new SliceRenderer(this.gpu, this.sliceCanvases[axis]!);
             }
             this.mipRenderer = new MIPRenderer(this.gpu, this.canvas3D);
+            try {
+                this.segmentationGpuCompute = new SegmentationGpuCompute(this.gpu);
+                this.segmentationGpuComputeFailed = false;
+            } catch (error) {
+                this.segmentationGpuCompute = null;
+                this.segmentationGpuComputeFailed = true;
+                console.warn('Segmentation GPU compute initialization failed; falling back to worker.', error);
+            }
 
             this.ct3DView.style.display = 'grid';
             this.placeholder.style.display = 'none';
@@ -372,6 +406,8 @@ export class ViewerApp {
     /** Tear down all persistent event listeners and owned resources. */
     dispose(): void {
         this.globalAbort.abort();
+        this.segmentationGpuCompute?.dispose();
+        this.segmentationGpuCompute = null;
         this.segmentationWorker.dispose();
         this.segmentationStore.clearMask();
         this.volumeStore.clear({ disposeStreaming: true, resetResolution: true });
@@ -589,6 +625,23 @@ export class ViewerApp {
         }
 
         const lookup = this.getMask3DLookup(mask.dimensions, targetDims);
+        if (lookup.conservative && mask.backend === 'sparse') {
+            out.fill(0);
+            const [sxSize, sySize, szSize] = mask.dimensions;
+            const rowStride = dx * dy;
+            const maxClassId = Math.min(255, mask.maxClassId);
+            for (let classId = 1; classId <= maxClassId; classId++) {
+                if (mask.getClassVoxelCount(classId) === 0) continue;
+                mask.forEachVoxelOfClass(classId, (sx, sy, sz) => {
+                    const tx = Math.min(dx - 1, Math.floor((sx * dx) / sxSize));
+                    const ty = Math.min(dy - 1, Math.floor((sy * dy) / sySize));
+                    const tz = Math.min(dz - 1, Math.floor((sz * dz) / szSize));
+                    out[tx + ty * dx + tz * rowStride] = classId;
+                });
+            }
+            return out;
+        }
+
         const classCounts = new Uint32Array(256);
         const touchedClasses = new Uint8Array(256);
         let touchedCount = 0;
@@ -703,11 +756,15 @@ export class ViewerApp {
         const seg = this.uiState.state.segmentation;
         const overlayEnabled = this.isSegmentationMode() && seg.visible;
         if (overlayEnabled && this.mask3DDirty) {
-            const labels = this.buildMask3DUploadData(targetDims);
-            if (labels) {
-                mip.uploadLabelVolume(labels, targetDims);
-            } else {
+            if (this.maskVolume.getNonZeroVoxelCount() === 0) {
                 mip.clearLabelVolume();
+            } else {
+                const labels = this.buildMask3DUploadData(targetDims);
+                if (labels) {
+                    mip.uploadLabelVolume(labels, targetDims);
+                } else {
+                    mip.clearLabelVolume();
+                }
             }
             this.mask3DDirty = false;
         }
@@ -873,6 +930,76 @@ export class ViewerApp {
         });
     }
 
+    private computeAutoRegionGrowTolerance(min: number, max: number): number {
+        const lo = Math.min(min, max);
+        const hi = Math.max(min, max);
+        const range = hi - lo;
+        if (!Number.isFinite(range) || range <= 0) return 0;
+        const scaled = range * 0.05;
+        const minTol = Math.max(1e-6, range * 1e-4);
+        return Math.min(64, Math.max(minTol, scaled));
+    }
+
+    private getSegmentationInputRange(seg: SegmentationSettings): { min: number; max: number; range: number } {
+        const sourceMin = this.volume ? this.volume.min : Math.min(seg.thresholdMin, seg.thresholdMax);
+        const sourceMax = this.volume ? this.volume.max : Math.max(seg.thresholdMin, seg.thresholdMax);
+        const min = Number.isFinite(sourceMin) ? sourceMin : 0;
+        const max = Number.isFinite(sourceMax) ? sourceMax : min;
+        const lo = Math.min(min, max);
+        const hi = Math.max(min, max);
+        return {
+            min: lo,
+            max: hi,
+            range: Math.max(0, hi - lo),
+        };
+    }
+
+    private getSegmentationNumberStep(range: number): number {
+        if (!Number.isFinite(range) || range <= 0) return 0.01;
+        const rough = range / 1000;
+        const exponent = Math.floor(Math.log10(Math.max(rough, 1e-6)));
+        const step = 10 ** exponent;
+        return Math.max(1e-6, Math.min(1000, step));
+    }
+
+    private formatSegmentationInputValue(value: number, step: number): string {
+        if (!Number.isFinite(value)) return '0';
+        if (!Number.isFinite(step) || step <= 0) return String(value);
+        const decimals = step >= 1 ? 0 : Math.min(6, Math.ceil(-Math.log10(step)));
+        return value.toFixed(decimals);
+    }
+
+    private applySegmentationNumericInputConfig(
+        seg: SegmentationSettings,
+        thresholdMinInput: HTMLInputElement | null,
+        thresholdMaxInput: HTMLInputElement | null,
+        toleranceInput: HTMLInputElement | null,
+    ): void {
+        const rangeInfo = this.getSegmentationInputRange(seg);
+        const thresholdStep = this.getSegmentationNumberStep(rangeInfo.range);
+        const toleranceStep = this.getSegmentationNumberStep(rangeInfo.range);
+        const toleranceDefault = this.computeAutoRegionGrowTolerance(rangeInfo.min, rangeInfo.max);
+
+        if (thresholdMinInput) {
+            thresholdMinInput.min = this.formatSegmentationInputValue(rangeInfo.min, thresholdStep);
+            thresholdMinInput.max = this.formatSegmentationInputValue(rangeInfo.max, thresholdStep);
+            thresholdMinInput.step = this.formatSegmentationInputValue(thresholdStep, thresholdStep);
+            thresholdMinInput.value = this.formatSegmentationInputValue(seg.thresholdMin, thresholdStep);
+        }
+        if (thresholdMaxInput) {
+            thresholdMaxInput.min = this.formatSegmentationInputValue(rangeInfo.min, thresholdStep);
+            thresholdMaxInput.max = this.formatSegmentationInputValue(rangeInfo.max, thresholdStep);
+            thresholdMaxInput.step = this.formatSegmentationInputValue(thresholdStep, thresholdStep);
+            thresholdMaxInput.value = this.formatSegmentationInputValue(seg.thresholdMax, thresholdStep);
+        }
+        if (toleranceInput) {
+            toleranceInput.min = '0';
+            toleranceInput.step = this.formatSegmentationInputValue(toleranceStep, toleranceStep);
+            toleranceInput.value = this.formatSegmentationInputValue(seg.regionGrowTolerance, toleranceStep);
+            toleranceInput.placeholder = this.formatSegmentationInputValue(toleranceDefault, toleranceStep);
+        }
+    }
+
     private rgb01ToHex(color: [number, number, number]): string {
         const toHex = (v: number) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
         return `#${toHex(color[0])}${toHex(color[1])}${toHex(color[2])}`;
@@ -903,6 +1030,48 @@ export class ViewerApp {
         }
 
         this.cancelActiveRoiStatsRebuild();
+
+        const classVoxelCount = mask.getClassVoxelCount(active.classId);
+        if (classVoxelCount === 0) {
+            const empty: ActiveRoiStatsAccumulator = {
+                roiId: active.id,
+                classId: active.classId,
+                voxels: 0,
+                sampleCount: 0,
+                sum: 0,
+                sumSq: 0,
+            };
+            this.activeRoiStatsRebuilding = false;
+            this.activeRoiStats = empty;
+            this.activeRoiStatsDirty = false;
+            this.applyActiveRoiStatsDisplay(empty);
+            return;
+        }
+
+        if (mask.backend === 'sparse') {
+            const acc: ActiveRoiStatsAccumulator = {
+                roiId: active.id,
+                classId: active.classId,
+                voxels: 0,
+                sampleCount: 0,
+                sum: 0,
+                sumSq: 0,
+            };
+            this.segmentationStore.forEachVoxelOfClass(acc.classId, (x, y, z) => {
+                acc.voxels++;
+                const value = volume.getValue(x, y, z);
+                if (value == null) return;
+                acc.sampleCount++;
+                acc.sum += value;
+                acc.sumSq += value * value;
+            });
+            this.activeRoiStatsRebuilding = false;
+            this.activeRoiStats = acc;
+            this.activeRoiStatsDirty = false;
+            this.applyActiveRoiStatsDisplay(acc);
+            return;
+        }
+
         const token = ++this.activeRoiStatsRebuildToken;
         this.activeRoiStatsRebuilding = true;
 
@@ -1113,9 +1282,7 @@ export class ViewerApp {
         if (opacityValue) opacityValue.textContent = seg.overlayOpacity.toFixed(2);
         if (segBrushSize) segBrushSize.value = String(seg.brushRadius);
         if (segBrushSizeValue) segBrushSizeValue.textContent = String(seg.brushRadius);
-        if (segThresholdMin) segThresholdMin.value = String(Math.round(seg.thresholdMin));
-        if (segThresholdMax) segThresholdMax.value = String(Math.round(seg.thresholdMax));
-        if (segGrowTolerance) segGrowTolerance.value = String(Math.round(seg.regionGrowTolerance));
+        this.applySegmentationNumericInputConfig(seg, segThresholdMin, segThresholdMax, segGrowTolerance);
         if (segSliceRadius) segSliceRadius.value = String(seg.regionGrowSliceRadius);
         if (this.segmentationPinBtn) {
             this.segmentationPinBtn.classList.toggle('active', seg.isPinned);
@@ -1755,7 +1922,16 @@ export class ViewerApp {
         next.overlayOpacity = Math.max(0, Math.min(1, next.overlayOpacity));
         next.brushRadius = Math.max(1, Math.min(64, Math.round(next.brushRadius)));
         next.activeClassId = Math.max(1, Math.min(255, Math.round(next.activeClassId)));
+        next.thresholdMin = Number.isFinite(next.thresholdMin) ? next.thresholdMin : 0;
+        next.thresholdMax = Number.isFinite(next.thresholdMax) ? next.thresholdMax : 0;
+        next.regionGrowTolerance = Number.isFinite(next.regionGrowTolerance) ? Math.max(0, next.regionGrowTolerance) : 0;
         next.regionGrowSliceRadius = Math.max(0, Math.min(MAX_SEGMENTATION_SLICE_RADIUS, Math.round(next.regionGrowSliceRadius)));
+        if (this.volume) {
+            const lo = Math.min(this.volume.min, this.volume.max);
+            const hi = Math.max(this.volume.min, this.volume.max);
+            next.thresholdMin = Math.max(lo, Math.min(hi, next.thresholdMin));
+            next.thresholdMax = Math.max(lo, Math.min(hi, next.thresholdMax));
+        }
         if (patch.activeTool !== undefined) {
             next.activeTool = patch.activeTool;
         } else if (patch.tool !== undefined || patch.paintValue !== undefined) {
@@ -1951,7 +2127,7 @@ export class ViewerApp {
 
     private estimate3DUploadBytesForDims(nx: number, ny: number, nz: number): number {
         const voxels = nx * ny * nz;
-        const texelBytes = this.gpu?.supportsFloat32Filtering ? 4 : 2;
+        const texelBytes = 2; // MIP volume is uploaded as r16float
         const volumeBytes = voxels * texelBytes;
         const brickCount = Math.ceil(nx / BRICK_SIZE) * Math.ceil(ny / BRICK_SIZE) * Math.ceil(nz / BRICK_SIZE);
         const brickBytes = brickCount * 4; // rg16float
@@ -2039,13 +2215,9 @@ export class ViewerApp {
     }
 
     /**
-     * Update the 3D resolution indicator overlay showing current dimensions.
+     * Refresh 3D resolution/status controls after a resolution change.
      */
-    private update3DResolutionIndicator(vol: VolumeData): void {
-        const indicator = document.getElementById('resolution3D');
-        if (!indicator) return;
-        const [nx, ny, nz] = vol.dimensions;
-        indicator.textContent = `${nx}x${ny}x${nz}`;
+    private update3DResolutionIndicator(_vol: VolumeData): void {
         this.update3DStatusChip();
     }
 
@@ -2306,9 +2478,13 @@ export class ViewerApp {
                     this.imageInfoEl.textContent =
                         `${w}x${h}x${d} ${fullInfo.dataType} ${fullInfo.memorySizeMB}MB`;
                     this.refreshFooterInfoDetails();
+                    const shouldAutoTuneTolerance = !this.uiState.state.segmentation.enabled;
                     this.setSegmentationState({
                         thresholdMin: fullVolume.min,
                         thresholdMax: fullVolume.max,
+                        ...(shouldAutoTuneTolerance
+                            ? { regionGrowTolerance: this.computeAutoRegionGrowTolerance(fullVolume.min, fullVolume.max) }
+                            : {}),
                     });
                     this.displayVolume();
                     this.hideLoadingOverlay();
@@ -2339,6 +2515,7 @@ export class ViewerApp {
             this.setSegmentationState({
                 thresholdMin: volume.min,
                 thresholdMax: volume.max,
+                regionGrowTolerance: this.computeAutoRegionGrowTolerance(volume.min, volume.max),
             });
             this.displayVolume();
             this.uiState.setFileLoaded(name);
@@ -2602,24 +2779,36 @@ export class ViewerApp {
         const seg = this.uiState.state.segmentation;
         this.segmentationWorkerBusy = true;
         this.setActiveRoiBusy(active.id, true);
+        const callStartedAt = performance.now();
+        const callStats: Record<RegionGrowBackend, RegionGrowPerfStats> = {
+            webgpu: createRegionGrowPerfStats(),
+            worker: createRegionGrowPerfStats(),
+        };
+        let changedTotal = 0;
+        let targetSliceCount = 0;
         try {
             const targetSlices = this.getSliceIndicesWithRadius(axis, hit.sliceIndex, seg.regionGrowSliceRadius);
-            let changedTotal = 0;
+            targetSliceCount = targetSlices.length;
             for (const sliceIndex of targetSlices) {
                 const slice = this.volume.getSlice(axis, sliceIndex);
                 const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
                 const sx = Math.max(0, Math.min(slice.width - 1, Math.floor(hit.sliceX)));
                 const sy = Math.max(0, Math.min(slice.height - 1, Math.floor(hit.sliceY)));
                 const seedIndex = sy * slice.width + sx;
-                const selected = await this.segmentationWorker.runRegionGrowSlice({
+                const result = await this.runRegionGrowSlice({
                     width: slice.width,
                     height: slice.height,
                     values,
                     seedIndex,
                     tolerance: Math.max(0, seg.regionGrowTolerance),
                 });
-                changedTotal += this.applySelectionIndicesToActiveRoi(axis, sliceIndex, slice.width, slice.height, selected);
+                const stats = callStats[result.backend];
+                stats.slices += 1;
+                stats.selected += result.selected.length;
+                stats.elapsedMs += result.elapsedMs;
+                changedTotal += this.applySelectionIndicesToActiveRoi(axis, sliceIndex, slice.width, slice.height, result.selected);
             }
+            this.logRegionGrowPerf(axis, targetSliceCount, changedTotal, performance.now() - callStartedAt, callStats);
             if (changedTotal > 0) {
                 this.invalidateActiveRoiStats();
                 this.scheduleAxisRender(axis);
@@ -2633,6 +2822,86 @@ export class ViewerApp {
             this.segmentationWorkerBusy = false;
             this.setActiveRoiBusy(active.id, false);
         }
+    }
+
+    private async runRegionGrowSlice(task: {
+        width: number;
+        height: number;
+        values: Float32Array;
+        seedIndex: number;
+        tolerance: number;
+    }): Promise<RegionGrowSliceResult> {
+        if (this.gpu?.isLost) {
+            this.segmentationGpuComputeFailed = true;
+        }
+        if (this.segmentationGpuCompute && !this.segmentationGpuComputeFailed) {
+            try {
+                const startedAt = performance.now();
+                const selected = await this.segmentationGpuCompute.runRegionGrowSlice(task);
+                const elapsedMs = performance.now() - startedAt;
+                if (elapsedMs > REGION_GROW_GPU_DISABLE_AFTER_MS) {
+                    this.segmentationGpuComputeFailed = true;
+                    console.warn(
+                        `WebGPU region grow is too slow on this GPU (${elapsedMs.toFixed(1)}ms slice). Falling back to worker for this session.`,
+                    );
+                }
+                return {
+                    selected,
+                    backend: 'webgpu',
+                    elapsedMs,
+                };
+            } catch (error) {
+                this.segmentationGpuComputeFailed = true;
+                console.warn('WebGPU region grow failed; falling back to worker path.', error);
+            }
+        }
+        const startedAt = performance.now();
+        const selected = await this.segmentationWorker.runRegionGrowSlice(task);
+        return {
+            selected,
+            backend: 'worker',
+            elapsedMs: performance.now() - startedAt,
+        };
+    }
+
+    private logRegionGrowPerf(
+        axis: ViewAxis,
+        targetSliceCount: number,
+        changedTotal: number,
+        totalElapsedMs: number,
+        callStats: Record<RegionGrowBackend, RegionGrowPerfStats>,
+    ): void {
+        for (const backend of ['webgpu', 'worker'] as const) {
+            this.regionGrowPerfTotals[backend].slices += callStats[backend].slices;
+            this.regionGrowPerfTotals[backend].selected += callStats[backend].selected;
+            this.regionGrowPerfTotals[backend].elapsedMs += callStats[backend].elapsedMs;
+        }
+
+        const selectedTotal = callStats.webgpu.selected + callStats.worker.selected;
+        const backendsUsed = (['webgpu', 'worker'] as const)
+            .filter((backend) => callStats[backend].slices > 0)
+            .map((backend) => {
+                const stats = callStats[backend];
+                const avgMs = stats.slices > 0 ? stats.elapsedMs / stats.slices : 0;
+                const voxelsPerSec = stats.elapsedMs > 0 ? (stats.selected * 1000) / stats.elapsedMs : 0;
+                return `${backend}(s=${stats.slices},sel=${stats.selected},avg=${avgMs.toFixed(2)}ms,vps=${Math.round(voxelsPerSec)})`;
+            })
+            .join(' ');
+        const backendSummary = backendsUsed || 'none';
+
+        const sessionSummary = (['webgpu', 'worker'] as const)
+            .map((backend) => {
+                const total = this.regionGrowPerfTotals[backend];
+                if (total.slices <= 0) return `${backend}(s=0)`;
+                const avgMs = total.elapsedMs / total.slices;
+                const voxelsPerSec = total.elapsedMs > 0 ? (total.selected * 1000) / total.elapsedMs : 0;
+                return `${backend}(s=${total.slices},avg=${avgMs.toFixed(2)}ms,vps=${Math.round(voxelsPerSec)})`;
+            })
+            .join(' ');
+
+        console.info(
+            `[RegionGrowPerf] axis=${axis} slices=${targetSliceCount} selected=${selectedTotal} changed=${changedTotal} total=${totalElapsedMs.toFixed(2)}ms ${backendSummary} session=${sessionSummary}`,
+        );
     }
 
     private undoSegmentationEdit(): void {
@@ -3486,9 +3755,7 @@ export class ViewerApp {
         if (segOpacityValue) segOpacityValue.textContent = seg.overlayOpacity.toFixed(2);
         if (segBrushSize) segBrushSize.value = String(seg.brushRadius);
         if (segBrushSizeValue) segBrushSizeValue.textContent = String(seg.brushRadius);
-        if (segThresholdMin) segThresholdMin.value = String(Math.round(seg.thresholdMin));
-        if (segThresholdMax) segThresholdMax.value = String(Math.round(seg.thresholdMax));
-        if (segGrowTolerance) segGrowTolerance.value = String(Math.round(seg.regionGrowTolerance));
+        this.applySegmentationNumericInputConfig(seg, segThresholdMin, segThresholdMax, segGrowTolerance);
         if (segSliceRadius) segSliceRadius.value = String(seg.regionGrowSliceRadius);
         if (segShowOnlyActiveToggle) segShowOnlyActiveToggle.checked = seg.showOnlyActive;
         this.updateSegmentationToolRows(seg.activeTool);
@@ -4831,13 +5098,13 @@ export class ViewerApp {
                         // 3D canvas: use DPR up to 2x, max 2048px, square aspect
                         const dpr = Math.min(window.devicePixelRatio || 1, 2);
                         const size = Math.min(width, height);
-                        const targetSize = Math.min(Math.floor(size * dpr), 2048);
+                        const targetSize = Math.max(1, Math.min(Math.floor(size * dpr), 2048));
                         canvas.width = targetSize;
                         canvas.height = targetSize;
                     } else {
                         const dpr = window.devicePixelRatio || 1;
-                        canvas.width = Math.floor(width * dpr);
-                        canvas.height = Math.floor(height * dpr);
+                        canvas.width = Math.max(1, Math.floor(width * dpr));
+                        canvas.height = Math.max(1, Math.floor(height * dpr));
                     }
                 }
             }

@@ -22,7 +22,7 @@ export const RENDER_MODE = {
     Compositing: 3,
 } as const;
 
-/** Convert Float32Array to Float16 (Uint16Array) for fallback path */
+/** Convert Float32Array to Float16 (Uint16Array) for compact 3D upload */
 function float32ToFloat16(src: Float32Array): Uint16Array {
     const dst = new Uint16Array(src.length);
     for (let i = 0; i < src.length; i++) {
@@ -142,13 +142,11 @@ export class MIPRenderer {
 
         this.transferFunction = new TransferFunction(device);
 
-        const canFilter = gpu.supportsFloat32Filtering;
-
         this.bindGroupLayout = device.createBindGroupLayout({
             entries: [
                 { binding: 0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
-                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: canFilter ? 'float' : 'unfilterable-float', viewDimension: '3d' } },
-                { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: canFilter ? 'filtering' : 'non-filtering' } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
                 { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
                 { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
                 { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
@@ -206,37 +204,21 @@ export class MIPRenderer {
         // Clear previous resources first so failed uploads do not leave stale textures bound.
         this.unloadVolume();
 
-        const canFilter = this.gpu.supportsFloat32Filtering;
-
         try {
-            if (canFilter) {
-                this.volumeTexture = device.createTexture({
-                    size: [nx, ny, nz],
-                    format: 'r32float',
-                    dimension: '3d',
-                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-                });
-                device.queue.writeTexture(
-                    { texture: this.volumeTexture },
-                    f32.buffer,
-                    { offset: f32.byteOffset, bytesPerRow: nx * 4, rowsPerImage: ny },
-                    [nx, ny, nz],
-                );
-            } else {
-                const f16 = float32ToFloat16(f32);
-                this.volumeTexture = device.createTexture({
-                    size: [nx, ny, nz],
-                    format: 'r16float',
-                    dimension: '3d',
-                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-                });
-                device.queue.writeTexture(
-                    { texture: this.volumeTexture },
-                    f16.buffer,
-                    { offset: f16.byteOffset, bytesPerRow: nx * 2, rowsPerImage: ny },
-                    [nx, ny, nz],
-                );
-            }
+            // Always upload as r16float to keep VRAM use predictable on very large datasets.
+            const f16 = float32ToFloat16(f32);
+            this.volumeTexture = device.createTexture({
+                size: [nx, ny, nz],
+                format: 'r16float',
+                dimension: '3d',
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+            });
+            device.queue.writeTexture(
+                { texture: this.volumeTexture },
+                f16.buffer,
+                { offset: f16.byteOffset, bytesPerRow: nx * 2, rowsPerImage: ny },
+                [nx, ny, nz],
+            );
 
             this.volumeSampler = device.createSampler({
                 magFilter: 'linear',
@@ -485,6 +467,7 @@ export class MIPRenderer {
 
         const device = this.gpu.device;
         const canvas = this.ctx.canvas;
+        if (canvas.width <= 0 || canvas.height <= 0) return;
 
         this.azimuth = wrapAngle(this.azimuth);
         this.elevation = wrapAngle(this.elevation);
@@ -552,6 +535,8 @@ export class MIPRenderer {
     /** Clear to the 3D viewport background tone */
     clear(): void {
         if (this.gpu.isLost) return;
+        const canvas = this.ctx.canvas;
+        if (canvas.width <= 0 || canvas.height <= 0) return;
         const encoder = this.gpu.device.createCommandEncoder();
         const pass = encoder.beginRenderPass({
             colorAttachments: [{
