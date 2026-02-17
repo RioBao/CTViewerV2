@@ -18,7 +18,7 @@ import { SegmentationGpuCompute } from '../segmentation/SegmentationGpuCompute.j
 import { ROIRegistry } from '../segmentation/ROIRegistry.js';
 import { SegmentationStore, type SegmentationTilesSnapshot } from '../segmentation/SegmentationStore.js';
 import type { BinaryMaskRLEJson } from '../segmentation/MaskPersistence.js';
-import { Sam2SliceService, type Sam2InferenceQuality } from '../ai/Sam2SliceService.js';
+import { Sam2SliceService, type Sam2InferenceQuality, type Sam2PromptPoint } from '../ai/Sam2SliceService.js';
 
 const DEG = Math.PI / 180;
 const AXES: ViewAxis[] = ['xy', 'xz', 'yz'];
@@ -32,7 +32,7 @@ const MASK_3D_SYNC_IDLE_MS = 48;
 const MASK_3D_SYNC_DRAG_MS = 140;
 const REGION_GROW_GPU_DISABLE_AFTER_MS = 900;
 const ENABLE_REGION_GROW_WEBGPU = false;
-const SMART_REGION_STATUS_DEFAULT = 'Click in a slice to run SAM2 on the current slice.';
+const SMART_REGION_STATUS_DEFAULT = 'Click to add SAM2 + prompts. Shift+click adds - prompts.';
 
 interface ActiveRoiStatsAccumulator {
     roiId: string;
@@ -109,13 +109,12 @@ interface RegionGrowPerfStats {
 interface SmartRegionPreview {
     axis: ViewAxis;
     sliceIndex: number;
+    sliceRadius: number;
     width: number;
     height: number;
     classId: number;
     volumeKey: string;
-    pointX: number;
-    pointY: number;
-    pointLabel: 0 | 1;
+    points: Sam2PromptPoint[];
     windowMin: number;
     windowMax: number;
     iouScore: number;
@@ -145,6 +144,7 @@ export class ViewerApp {
     private maskSliceBuffers: Record<ViewAxis, MaskTypedArray | null> = { xy: null, xz: null, yz: null };
     private maskDisplaySliceBuffers: Record<ViewAxis, MaskTypedArray | null> = { xy: null, xz: null, yz: null };
     private maskPreviewSliceBuffers: Record<ViewAxis, MaskTypedArray | null> = { xy: null, xz: null, yz: null };
+    private smartRegionPromptLayers: Record<ViewAxis, HTMLDivElement | null> = { xy: null, xz: null, yz: null };
     private maskPaletteData = new Float32Array(256 * 4);
     private statsRefreshTimer: number | null = null;
     private statsRefreshQueued = false;
@@ -511,6 +511,7 @@ export class ViewerApp {
 
         renderer.updateSlice(slice, maskSliceData);
         renderer.render();
+        this.updateSmartRegionPromptMarkers(axis, index, renderer);
 
         // Update low-res indicator
         const indicator = document.getElementById(`lowres${axis.toUpperCase()}`) as HTMLElement | null;
@@ -2746,11 +2747,79 @@ export class ViewerApp {
         }
     }
 
+    private getSmartRegionPromptLayer(axis: ViewAxis): HTMLDivElement | null {
+        const existing = this.smartRegionPromptLayers[axis];
+        if (existing) return existing;
+        const container = this.viewportContainers[axis];
+        if (!container) return null;
+        const layer = document.createElement('div');
+        layer.className = 'smart-prompt-layer';
+        container.appendChild(layer);
+        this.smartRegionPromptLayers[axis] = layer;
+        return layer;
+    }
+
+    private clearSmartRegionPromptMarkers(axis?: ViewAxis): void {
+        const axes = axis ? [axis] : AXES;
+        for (const a of axes) {
+            const layer = this.smartRegionPromptLayers[a];
+            if (!layer) continue;
+            layer.textContent = '';
+            layer.style.display = 'none';
+        }
+    }
+
+    private updateSmartRegionPromptMarkers(axis: ViewAxis, sliceIndex: number, renderer: SliceRenderer): void {
+        const layer = this.getSmartRegionPromptLayer(axis);
+        if (!layer) return;
+        const preview = this.smartRegionPreview;
+        if (!preview || preview.axis !== axis || preview.sliceIndex !== sliceIndex || preview.points.length === 0) {
+            layer.textContent = '';
+            layer.style.display = 'none';
+            return;
+        }
+
+        const canvas = this.sliceCanvases[axis];
+        if (!canvas || canvas.clientWidth <= 0 || canvas.clientHeight <= 0) {
+            layer.textContent = '';
+            layer.style.display = 'none';
+            return;
+        }
+
+        const dpr = canvas.width / canvas.clientWidth;
+        if (!Number.isFinite(dpr) || dpr <= 0) {
+            layer.textContent = '';
+            layer.style.display = 'none';
+            return;
+        }
+
+        layer.textContent = '';
+        layer.style.display = '';
+        for (let i = 0; i < preview.points.length; i++) {
+            const point = preview.points[i];
+            const [canvasX, canvasY] = renderer.sliceToCanvas(point.x + 0.5, point.y + 0.5);
+            const cssX = canvasX / dpr;
+            const cssY = canvasY / dpr;
+            if (!Number.isFinite(cssX) || !Number.isFinite(cssY)) continue;
+
+            const marker = document.createElement('div');
+            marker.className = `smart-prompt-marker ${point.label === 1 ? 'positive' : 'negative'}`;
+            marker.textContent = point.label === 1 ? '+' : '-';
+            marker.style.left = `${cssX}px`;
+            marker.style.top = `${cssY}px`;
+            layer.appendChild(marker);
+        }
+    }
+
     private clearSmartRegionPreview(options?: { render?: boolean; resetStatus?: boolean }): void {
         const prev = this.smartRegionPreview;
-        if (!prev && !options?.resetStatus) return;
+        if (!prev && !options?.resetStatus) {
+            this.clearSmartRegionPromptMarkers();
+            return;
+        }
         this.smartRegionPreview = null;
         this.maskPreviewSliceBuffers = { xy: null, xz: null, yz: null };
+        this.clearSmartRegionPromptMarkers();
         this.refreshSmartRegionPreviewControls();
         if (options?.resetStatus) {
             this.setSmartRegionStatus(SMART_REGION_STATUS_DEFAULT);
@@ -2770,45 +2839,74 @@ export class ViewerApp {
     private async applySmartRegionPreview(): Promise<number> {
         const preview = this.smartRegionPreview;
         if (!preview) return 0;
-        let selectedIndices = preview.selectedIndices;
+        let centerSelectedIndices = preview.selectedIndices;
         let refined = false;
         const volume = this.volume;
         const active = this.getActiveRoi();
+        const configuredRadius = this.uiState.state.segmentation.regionGrowSliceRadius;
+        const targetSlices = volume
+            ? this.getSliceIndicesWithRadius(preview.axis, preview.sliceIndex, configuredRadius)
+            : [preview.sliceIndex];
         const canRefine =
             preview.qualityUsed === 'preview'
             && !!volume
             && !!active
             && !active.locked
             && preview.volumeKey === this.buildSmartRegionVolumeKey(volume);
+        const needsSliceRadiusInference = targetSlices.length > 1;
+        const shouldRunApplyInference = canRefine || needsSliceRadiusInference;
+        let changed = 0;
 
-        if (canRefine) {
-            const slice = volume.getSlice(preview.axis, preview.sliceIndex);
-            const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
+        if (shouldRunApplyInference && volume && active) {
+            const lastPoint = preview.points[preview.points.length - 1] ?? {
+                x: Math.floor(preview.width / 2),
+                y: Math.floor(preview.height / 2),
+                label: 1 as 0 | 1,
+            };
+            const applyQuality: Sam2InferenceQuality = canRefine ? 'full' : preview.qualityUsed;
             this.segmentationWorkerBusy = true;
             this.setActiveRoiBusy(active.id, true);
             this.refreshSmartRegionPreviewControls();
-            this.setSmartRegionStatus('SAM2 refining full quality...');
+            this.setSmartRegionStatus(
+                canRefine
+                    ? 'SAM2 refining full quality...'
+                    : `SAM2 applying across ${targetSlices.length} slices...`,
+            );
             try {
                 const service = this.getSmartRegionService();
-                const result = await service.segmentFromClick({
-                    volumeKey: preview.volumeKey,
-                    axis: preview.axis,
-                    sliceIndex: preview.sliceIndex,
-                    width: slice.width,
-                    height: slice.height,
-                    values,
-                    pointX: preview.pointX,
-                    pointY: preview.pointY,
-                    pointLabel: preview.pointLabel,
-                    windowMin: preview.windowMin,
-                    windowMax: preview.windowMax,
-                    inferenceQuality: 'full',
-                });
                 this.updateSmartRegionBackendChip(service.isUsingWasmFallback());
-                selectedIndices = result.selectedIndices;
-                refined = true;
+                for (const sliceIndex of targetSlices) {
+                    const slice = volume.getSlice(preview.axis, sliceIndex);
+                    const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
+                    const result = await service.segmentFromClick({
+                        volumeKey: preview.volumeKey,
+                        axis: preview.axis,
+                        sliceIndex,
+                        width: slice.width,
+                        height: slice.height,
+                        values,
+                        pointX: lastPoint.x,
+                        pointY: lastPoint.y,
+                        pointLabel: lastPoint.label,
+                        points: preview.points,
+                        windowMin: preview.windowMin,
+                        windowMax: preview.windowMax,
+                        inferenceQuality: applyQuality,
+                    });
+                    if (sliceIndex === preview.sliceIndex) {
+                        centerSelectedIndices = result.selectedIndices;
+                    }
+                    changed += this.applySelectionIndicesToActiveRoi(
+                        preview.axis,
+                        sliceIndex,
+                        slice.width,
+                        slice.height,
+                        result.selectedIndices,
+                    );
+                }
+                refined = canRefine;
             } catch (error) {
-                console.warn('SAM2 full-quality refine failed; applying fast preview result.', error);
+                console.warn('SAM2 apply-time inference failed; using available preview result.', error);
             } finally {
                 this.segmentationWorkerBusy = false;
                 this.setActiveRoiBusy(active.id, false);
@@ -2816,13 +2914,15 @@ export class ViewerApp {
             }
         }
 
-        const changed = this.applySelectionIndicesToActiveRoi(
-            preview.axis,
-            preview.sliceIndex,
-            preview.width,
-            preview.height,
-            selectedIndices,
-        );
+        if (changed === 0) {
+            changed = this.applySelectionIndicesToActiveRoi(
+                preview.axis,
+                preview.sliceIndex,
+                preview.width,
+                preview.height,
+                centerSelectedIndices,
+            );
+        }
         this.clearSmartRegionPreview({ render: true });
         if (changed > 0) {
             this.invalidateActiveRoiStats();
@@ -2831,7 +2931,7 @@ export class ViewerApp {
             this.schedule3DMaskSync({ immediate: true, render: true });
         }
         this.setSmartRegionStatus(
-            `SAM2 ${refined ? 'refined+applied' : 'preview applied'}: ${selectedIndices.length.toLocaleString()} voxels (${changed.toLocaleString()} changed).`,
+            `SAM2 ${refined ? 'refined+applied' : 'preview applied'}: ${centerSelectedIndices.length.toLocaleString()} voxels (${changed.toLocaleString()} changed, ${targetSlices.length} slices).`,
         );
         return changed;
     }
@@ -3063,6 +3163,7 @@ export class ViewerApp {
         } finally {
             this.segmentationWorkerBusy = false;
             this.setActiveRoiBusy(active.id, false);
+            this.refreshSmartRegionPreviewControls();
         }
     }
 
@@ -3084,9 +3185,28 @@ export class ViewerApp {
         const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
         const pointX = Math.max(0, Math.min(slice.width - 1, Math.floor(hit.sliceX)));
         const pointY = Math.max(0, Math.min(slice.height - 1, Math.floor(hit.sliceY)));
+        const clickedPoint: Sam2PromptPoint = { x: pointX, y: pointY, label: pointLabel };
         const volumeKey = this.buildSmartRegionVolumeKey(volume);
         const { windowMin, windowMax } = this.getSmartRegionWindow(volume);
+        const seg = this.uiState.state.segmentation;
+        const targetSlices = this.getSliceIndicesWithRadius(axis, hit.sliceIndex, seg.regionGrowSliceRadius);
         const inferenceQuality: Sam2InferenceQuality = this.smartRegionPreviewOnly ? 'preview' : 'full';
+        let promptPoints: Sam2PromptPoint[] = [clickedPoint];
+        if (this.smartRegionPreviewOnly) {
+            const existing = this.smartRegionPreview;
+            const sameContext = !!existing
+                && existing.axis === axis
+                && existing.sliceIndex === hit.sliceIndex
+                && existing.width === slice.width
+                && existing.height === slice.height
+                && existing.volumeKey === volumeKey
+                && Math.abs(existing.windowMin - windowMin) <= 1e-6
+                && Math.abs(existing.windowMax - windowMax) <= 1e-6;
+            if (sameContext) {
+                promptPoints = existing.points.slice();
+                promptPoints.push(clickedPoint);
+            }
+        }
 
         this.segmentationWorkerBusy = true;
         this.setActiveRoiBusy(active.id, true);
@@ -3109,6 +3229,7 @@ export class ViewerApp {
                 pointX,
                 pointY,
                 pointLabel,
+                points: promptPoints,
                 windowMin,
                 windowMax,
                 inferenceQuality,
@@ -3124,13 +3245,12 @@ export class ViewerApp {
                 this.setSmartRegionPreview({
                     axis,
                     sliceIndex: hit.sliceIndex,
+                    sliceRadius: seg.regionGrowSliceRadius,
                     width: slice.width,
                     height: slice.height,
                     classId: active.classId,
                     volumeKey,
-                    pointX,
-                    pointY,
-                    pointLabel,
+                    points: promptPoints,
                     windowMin,
                     windowMax,
                     iouScore: result.iouScore,
@@ -3138,19 +3258,61 @@ export class ViewerApp {
                     selectedIndices: result.selectedIndices,
                 });
                 this.setSmartRegionStatus(
-                    `SAM2 ${promptTag} preview (${qualityTag}): ${result.selectedIndices.length.toLocaleString()} voxels (${cacheTag}, ${totalMs.toFixed(0)}ms).`,
+                    `SAM2 ${promptTag} preview (${qualityTag}, ${promptPoints.length} pts): ${result.selectedIndices.length.toLocaleString()} voxels (${cacheTag}, ${totalMs.toFixed(0)}ms).`,
                 );
             } else {
                 this.clearSmartRegionPreview({ render: true });
-                changed = this.applySelectionIndicesToActiveRoi(
-                    axis,
-                    hit.sliceIndex,
-                    slice.width,
-                    slice.height,
-                    result.selectedIndices,
-                );
+                let selectedTotal = 0;
+                let iouScore = 0;
+                let encodeMs = 0;
+                let decodeMs = 0;
+                let cacheHitCount = 0;
+
+                for (const sliceIndex of targetSlices) {
+                    let sliceResult = result;
+                    let sliceData = slice;
+                    if (sliceIndex !== hit.sliceIndex) {
+                        sliceData = volume.getSlice(axis, sliceIndex);
+                        const sliceValues = sliceData.data instanceof Float32Array ? sliceData.data : new Float32Array(sliceData.data);
+                        const slicePointX = Math.max(0, Math.min(sliceData.width - 1, pointX));
+                        const slicePointY = Math.max(0, Math.min(sliceData.height - 1, pointY));
+                        sliceResult = await service.segmentFromClick({
+                            volumeKey,
+                            axis,
+                            sliceIndex,
+                            width: sliceData.width,
+                            height: sliceData.height,
+                            values: sliceValues,
+                            pointX: slicePointX,
+                            pointY: slicePointY,
+                            pointLabel,
+                            points: promptPoints,
+                            windowMin,
+                            windowMax,
+                            inferenceQuality,
+                        });
+                    }
+                    selectedTotal += sliceResult.selectedIndices.length;
+                    iouScore += sliceResult.iouScore;
+                    encodeMs += sliceResult.timings.encodeMs;
+                    decodeMs += sliceResult.timings.decodeMs;
+                    if (sliceResult.embeddingCacheHit) cacheHitCount += 1;
+                    changed += this.applySelectionIndicesToActiveRoi(
+                        axis,
+                        sliceIndex,
+                        sliceData.width,
+                        sliceData.height,
+                        sliceResult.selectedIndices,
+                    );
+                }
+                const avgIou = targetSlices.length > 0 ? iouScore / targetSlices.length : 0;
+                const cacheSummary = cacheHitCount === targetSlices.length
+                    ? 'cache'
+                    : cacheHitCount === 0
+                        ? 'encoded'
+                        : `${cacheHitCount}/${targetSlices.length} cache`;
                 this.setSmartRegionStatus(
-                    `SAM2 ${promptTag} (${qualityTag}): ${result.selectedIndices.length.toLocaleString()} voxels (${cacheTag}, ${totalMs.toFixed(0)}ms)`,
+                    `SAM2 ${promptTag} (${qualityTag}): ${selectedTotal.toLocaleString()} voxels (${cacheSummary}, ${targetSlices.length} slices, ${totalMs.toFixed(0)}ms)`,
                 );
                 if (changed > 0) {
                     this.invalidateActiveRoiStats();
@@ -3159,10 +3321,15 @@ export class ViewerApp {
                     this.updatePixelInfo();
                     this.schedule3DMaskSync({ immediate: true, render: true });
                 }
+                console.info(
+                    `[SmartRegion] axis=${axis} slice=${hit.sliceIndex} selected=${selectedTotal} changed=${changed} preview=${this.smartRegionPreviewOnly} quality=${result.qualityUsed} points=${promptPoints.length} slices=${targetSlices.length} total=${totalMs.toFixed(2)}ms encode=${encodeMs.toFixed(2)}ms decode=${decodeMs.toFixed(2)}ms iou=${avgIou.toFixed(3)} cacheHits=${cacheHitCount}`,
+                );
+                this.refreshSmartRegionPreviewControls();
+                return;
             }
             this.refreshSmartRegionPreviewControls();
             console.info(
-                `[SmartRegion] axis=${axis} slice=${hit.sliceIndex} selected=${result.selectedIndices.length} changed=${changed} preview=${this.smartRegionPreviewOnly} quality=${result.qualityUsed} total=${totalMs.toFixed(2)}ms encode=${result.timings.encodeMs.toFixed(2)}ms decode=${result.timings.decodeMs.toFixed(2)}ms iou=${result.iouScore.toFixed(3)} cache=${result.embeddingCacheHit ? 'hit' : 'miss'}`,
+                `[SmartRegion] axis=${axis} slice=${hit.sliceIndex} selected=${result.selectedIndices.length} changed=${changed} preview=${this.smartRegionPreviewOnly} quality=${result.qualityUsed} points=${promptPoints.length} total=${totalMs.toFixed(2)}ms encode=${result.timings.encodeMs.toFixed(2)}ms decode=${result.timings.decodeMs.toFixed(2)}ms iou=${result.iouScore.toFixed(3)} cache=${result.embeddingCacheHit ? 'hit' : 'miss'}`,
             );
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -4277,9 +4444,11 @@ export class ViewerApp {
             });
         }
         if (segSliceRadius) {
-            segSliceRadius.addEventListener('change', () => {
+            const updateSliceRadius = () => {
                 this.setSegmentationState({ regionGrowSliceRadius: parseInt(segSliceRadius.value, 10) || 0 });
-            });
+            };
+            segSliceRadius.addEventListener('input', updateSliceRadius);
+            segSliceRadius.addEventListener('change', updateSliceRadius);
         }
     }
 

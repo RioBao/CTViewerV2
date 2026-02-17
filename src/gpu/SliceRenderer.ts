@@ -224,6 +224,21 @@ export class SliceRenderer {
         return [sx, sy];
     }
 
+    /** Convert slice pixel coordinates to canvas pixel coordinates */
+    sliceToCanvas(sliceX: number, sliceY: number): [number, number] {
+        const cw = this.canvas.width;
+        const ch = this.canvas.height;
+        const w = this.sliceWidth;
+        const h = this.sliceHeight;
+        if (w === 0 || h === 0) return [-1, -1];
+
+        const fitScale = Math.min(cw / w, ch / h);
+        const rx = (sliceX + this.panX - w / 2) * fitScale * this.zoom;
+        const ry = (sliceY + this.panY - h / 2) * fitScale * this.zoom;
+        const [dx, dy] = this.rotateCanvasDelta(rx, ry, this.rotationQuarter);
+        return [dx + cw / 2, dy + ch / 2];
+    }
+
     /** Convert canvas pixel delta to slice pixel delta (for pan) */
     canvasDeltaToSlice(dx: number, dy: number): [number, number] {
         const cw = this.canvas.width;

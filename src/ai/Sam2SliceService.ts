@@ -6,6 +6,14 @@ const SAM2_PREVIEW_INPUT_SIZE = 512;
 const SAM2_MASK_SIZE = 256;
 const SAM2_CACHE_LIMIT = 8;
 const DEFAULT_MASK_THRESHOLD = 0;
+const PREVIEW_MASK_LOGIT_THRESHOLD = 0.12;
+const AUTO_WINDOW_SAMPLE_CAP = 16384;
+const AUTO_HISTOGRAM_BINS = 256;
+const AUTO_P01 = 0.01;
+const AUTO_P20 = 0.20;
+const AUTO_P50 = 0.50;
+const AUTO_P80 = 0.80;
+const AUTO_P99 = 0.99;
 
 const DEFAULT_MODEL_BASE_URL = getViteEnvString('VITE_SAM2_MODEL_BASE_URL') ?? 'https://huggingface.co/SharpAI/sam2-hiera-tiny-onnx/resolve/main';
 const DEFAULT_ENCODER_URL = getViteEnvString('VITE_SAM2_ENCODER_URL') ?? `${DEFAULT_MODEL_BASE_URL}/encoder.with_runtime_opt.ort`;
@@ -40,12 +48,18 @@ export interface Sam2SliceRequest {
     pointX: number;
     pointY: number;
     pointLabel: 0 | 1;
+    points?: Sam2PromptPoint[];
     windowMin: number;
     windowMax: number;
     inferenceQuality?: Sam2InferenceQuality;
 }
 
 export type Sam2InferenceQuality = 'preview' | 'full';
+export interface Sam2PromptPoint {
+    x: number;
+    y: number;
+    label: 0 | 1;
+}
 
 export interface Sam2SliceTimings {
     encodeMs: number;
@@ -118,6 +132,86 @@ async function assertModelUrlIsBinary(url: string, modelLabel: string): Promise<
 function clamp01(value: number): number {
     if (!Number.isFinite(value)) return 0;
     return Math.max(0, Math.min(1, value));
+}
+
+function percentileFromSorted(sorted: Float32Array, q: number): number {
+    if (sorted.length === 0) return 0;
+    const qq = Math.max(0, Math.min(1, q));
+    if (sorted.length === 1) return sorted[0];
+    const pos = qq * (sorted.length - 1);
+    const lo = Math.floor(pos);
+    const hi = Math.min(sorted.length - 1, Math.ceil(pos));
+    if (lo === hi) return sorted[lo];
+    const t = pos - lo;
+    return sorted[lo] * (1 - t) + sorted[hi] * t;
+}
+
+function computeMultiOtsuThresholds3Class(
+    values: Float32Array,
+    valueMin: number,
+    valueMax: number,
+    binCountRaw: number,
+): [number, number] | null {
+    if (values.length < 3) return null;
+    if (!(valueMax > valueMin)) return null;
+    const binCount = Math.max(16, Math.floor(binCountRaw));
+    const histogram = new Float64Array(binCount);
+    const range = valueMax - valueMin;
+    const scale = (binCount - 1) / range;
+    for (let i = 0; i < values.length; i++) {
+        const value = values[i];
+        const bin = Math.max(0, Math.min(binCount - 1, Math.floor((value - valueMin) * scale)));
+        histogram[bin] += 1;
+    }
+
+    const total = values.length;
+    const probs = new Float64Array(binCount);
+    const omega = new Float64Array(binCount);
+    const mu = new Float64Array(binCount);
+    let omegaAcc = 0;
+    let muAcc = 0;
+    for (let i = 0; i < binCount; i++) {
+        const p = histogram[i] / total;
+        probs[i] = p;
+        omegaAcc += p;
+        muAcc += p * i;
+        omega[i] = omegaAcc;
+        mu[i] = muAcc;
+    }
+    const muTotal = mu[binCount - 1];
+    const eps = 1e-8;
+    let bestScore = -Infinity;
+    let bestT1 = -1;
+    let bestT2 = -1;
+    for (let t1 = 0; t1 < binCount - 2; t1++) {
+        const w0 = omega[t1];
+        if (w0 <= eps) continue;
+        const m0 = mu[t1] / w0;
+        for (let t2 = t1 + 1; t2 < binCount - 1; t2++) {
+            const w1 = omega[t2] - omega[t1];
+            const w2 = 1 - omega[t2];
+            if (w1 <= eps || w2 <= eps) continue;
+            const m1 = (mu[t2] - mu[t1]) / w1;
+            const m2 = (muTotal - mu[t2]) / w2;
+            const score = w0 * (m0 - muTotal) * (m0 - muTotal)
+                + w1 * (m1 - muTotal) * (m1 - muTotal)
+                + w2 * (m2 - muTotal) * (m2 - muTotal);
+            if (score > bestScore) {
+                bestScore = score;
+                bestT1 = t1;
+                bestT2 = t2;
+            }
+        }
+    }
+
+    if (bestT1 < 0 || bestT2 <= bestT1) {
+        return null;
+    }
+
+    const threshold1 = valueMin + ((bestT1 + 1) / binCount) * range;
+    const threshold2 = valueMin + ((bestT2 + 1) / binCount) * range;
+    if (!(threshold2 > threshold1)) return null;
+    return [threshold1, threshold2];
 }
 
 function disposeTensor(tensor: ort.Tensor | null | undefined): void {
@@ -223,6 +317,7 @@ export class Sam2SliceService {
             const pointX = Math.max(0, Math.min(width - 1, Math.floor(request.pointX)));
             const pointY = Math.max(0, Math.min(height - 1, Math.floor(request.pointY)));
             const pointLabel: 0 | 1 = request.pointLabel === 0 ? 0 : 1;
+            const promptPoints = this.normalizePromptPoints(request.points, width, height, pointX, pointY, pointLabel);
 
             const windowMin = Number.isFinite(request.windowMin) ? request.windowMin : 0;
             const windowMaxRaw = Number.isFinite(request.windowMax) ? request.windowMax : windowMin + 1;
@@ -273,15 +368,21 @@ export class Sam2SliceService {
             const encodeMs = performance.now() - encodeStartAt;
 
             const decodeStartAt = performance.now();
-            const { inputs, temporaries } = this.buildDecoderInputs(embedding, width, height, pointX, pointY, pointLabel);
-            let selectedIndices = new Uint32Array(0);
+            const { inputs, temporaries } = this.buildDecoderInputs(embedding, width, height, promptPoints);
+            let selectedIndices: Uint32Array = new Uint32Array(0);
             let iouScore = 0;
             try {
                 const decoderOutputs = await this.decoderSession!.run(inputs);
                 const masks = getRequiredTensor(decoderOutputs, 'masks');
                 const iouPredictions = getRequiredTensor(decoderOutputs, 'iou_predictions');
-                const decoded = await this.decodeMasksToIndices(masks, iouPredictions, width, height);
+                const maskThreshold = qualityUsed === 'preview'
+                    ? Math.max(this.maskThreshold, PREVIEW_MASK_LOGIT_THRESHOLD)
+                    : this.maskThreshold;
+                const decoded = await this.decodeMasksToIndices(masks, iouPredictions, width, height, maskThreshold);
                 selectedIndices = new Uint32Array(decoded.selectedIndices);
+                if (qualityUsed === 'preview') {
+                    selectedIndices = this.filterPreviewSmallIslands(selectedIndices, width, height);
+                }
                 iouScore = decoded.iouScore;
             } finally {
                 for (const tensor of temporaries) {
@@ -411,6 +512,31 @@ export class Sam2SliceService {
         return /shape|dimension|mismatch|invalid input|invalid dimensions|inferred/i.test(message);
     }
 
+    private normalizePromptPoints(
+        points: Sam2PromptPoint[] | undefined,
+        width: number,
+        height: number,
+        fallbackX: number,
+        fallbackY: number,
+        fallbackLabel: 0 | 1,
+    ): Sam2PromptPoint[] {
+        if (!Array.isArray(points) || points.length === 0) {
+            return [{ x: fallbackX, y: fallbackY, label: fallbackLabel }];
+        }
+        const normalized: Sam2PromptPoint[] = [];
+        for (const point of points) {
+            if (!point) continue;
+            const x = Math.max(0, Math.min(width - 1, Math.floor(point.x)));
+            const y = Math.max(0, Math.min(height - 1, Math.floor(point.y)));
+            const label: 0 | 1 = point.label === 0 ? 0 : 1;
+            normalized.push({ x, y, label });
+        }
+        if (normalized.length === 0) {
+            normalized.push({ x: fallbackX, y: fallbackY, label: fallbackLabel });
+        }
+        return normalized;
+    }
+
     private async computeEmbedding(
         cacheKey: string,
         values: Float32Array,
@@ -462,44 +588,124 @@ export class Sam2SliceService {
         inputSize: number,
     ): void {
         const planeSize = inputSize * inputSize;
-        const invRange = 1 / Math.max(1e-6, windowMax - windowMin);
+        const windows = this.buildAutoPseudoRgbWindows(values, windowMin, windowMax);
+        const minR = windows[0][0];
+        const minG = windows[1][0];
+        const minB = windows[2][0];
+        const invR = 1 / Math.max(1e-6, windows[0][1] - windows[0][0]);
+        const invG = 1 / Math.max(1e-6, windows[1][1] - windows[1][0]);
+        const invB = 1 / Math.max(1e-6, windows[2][1] - windows[2][0]);
 
         for (let y = 0; y < inputSize; y++) {
             const sy = Math.min(height - 1, Math.floor((y * height) / inputSize));
             for (let x = 0; x < inputSize; x++) {
                 const sx = Math.min(width - 1, Math.floor((x * width) / inputSize));
                 const srcIndex = sy * width + sx;
-                const gray = clamp01((values[srcIndex] - windowMin) * invRange);
+                const value = values[srcIndex];
+                const red = clamp01((value - minR) * invR);
+                const green = clamp01((value - minG) * invG);
+                const blue = clamp01((value - minB) * invB);
                 const dstIndex = y * inputSize + x;
-                out[dstIndex] = (gray - IMAGE_MEAN[0]) / IMAGE_STD[0];
-                out[planeSize + dstIndex] = (gray - IMAGE_MEAN[1]) / IMAGE_STD[1];
-                out[2 * planeSize + dstIndex] = (gray - IMAGE_MEAN[2]) / IMAGE_STD[2];
+                out[dstIndex] = (red - IMAGE_MEAN[0]) / IMAGE_STD[0];
+                out[planeSize + dstIndex] = (green - IMAGE_MEAN[1]) / IMAGE_STD[1];
+                out[2 * planeSize + dstIndex] = (blue - IMAGE_MEAN[2]) / IMAGE_STD[2];
             }
         }
+    }
+
+    private buildAutoPseudoRgbWindows(
+        values: Float32Array,
+        fallbackMinRaw: number,
+        fallbackMaxRaw: number,
+    ): [[number, number], [number, number], [number, number]] {
+        const sampleCount = Math.max(1, Math.min(values.length, AUTO_WINDOW_SAMPLE_CAP));
+        const sample = new Float32Array(sampleCount);
+        if (values.length <= sampleCount) {
+            sample.set(values.subarray(0, sampleCount));
+        } else {
+            const scale = (values.length - 1) / Math.max(1, sampleCount - 1);
+            for (let i = 0; i < sampleCount; i++) {
+                sample[i] = values[Math.floor(i * scale)];
+            }
+        }
+        sample.sort();
+
+        const p01 = percentileFromSorted(sample, AUTO_P01);
+        const p20 = percentileFromSorted(sample, AUTO_P20);
+        const p50 = percentileFromSorted(sample, AUTO_P50);
+        const p80 = percentileFromSorted(sample, AUTO_P80);
+        const p99 = percentileFromSorted(sample, AUTO_P99);
+
+        const sampleMin = sample[0];
+        const sampleMax = sample[sample.length - 1];
+        let fallbackMin = Number.isFinite(fallbackMinRaw) ? fallbackMinRaw : sampleMin;
+        let fallbackMax = Number.isFinite(fallbackMaxRaw) ? fallbackMaxRaw : sampleMax;
+        if (!(fallbackMax > fallbackMin)) {
+            fallbackMin = sampleMin;
+            fallbackMax = sampleMax;
+        }
+        if (!(fallbackMax > fallbackMin)) {
+            fallbackMin = 0;
+            fallbackMax = 1;
+        }
+
+        const normalizeWindow = (minRaw: number, maxRaw: number): [number, number] => {
+            let min = Number.isFinite(minRaw) ? minRaw : fallbackMin;
+            let max = Number.isFinite(maxRaw) ? maxRaw : fallbackMax;
+            if (!(max > min)) {
+                min = fallbackMin;
+                max = fallbackMax;
+            }
+            if (!(max > min)) {
+                max = min + 1;
+            }
+            return [min, max];
+        };
+
+        const otsuThresholds = computeMultiOtsuThresholds3Class(sample, sampleMin, sampleMax, AUTO_HISTOGRAM_BINS);
+        if (otsuThresholds) {
+            const [t1, t2] = otsuThresholds;
+            const overlap = 0.05 * Math.max(1e-6, fallbackMax - fallbackMin);
+            return [
+                normalizeWindow(fallbackMin, t1 + overlap), // Air / low density
+                normalizeWindow(t1 - overlap, t2 + overlap), // Intermediate material
+                normalizeWindow(t2 - overlap, fallbackMax), // Dense / metal
+            ];
+        }
+
+        return [
+            normalizeWindow(p01, p80), // Low density / broad context
+            normalizeWindow(p20, p80), // Mid-density focus
+            normalizeWindow(p50, p99), // High-density emphasis
+        ];
     }
 
     private buildDecoderInputs(
         embedding: Sam2EmbeddingCacheEntry,
         width: number,
         height: number,
-        pointX: number,
-        pointY: number,
-        pointLabel: 0 | 1,
+        points: Sam2PromptPoint[],
     ): { inputs: Record<string, ort.Tensor>; temporaries: ort.Tensor[] } {
         const scaleX = width > 1 ? (embedding.inputSize - 1) / (width - 1) : 0;
         const scaleY = height > 1 ? (embedding.inputSize - 1) / (height - 1) : 0;
-        const pointCoords = new Float32Array([
-            pointX * scaleX,
-            pointY * scaleY,
-            0,
-            0,
-        ]);
-        const pointLabels = new Float32Array([pointLabel, -1]);
+        const promptCount = points.length;
+        const pointCoords = new Float32Array((promptCount + 1) * 2);
+        const pointLabels = new Float32Array(promptCount + 1);
+        for (let i = 0; i < promptCount; i++) {
+            const point = points[i];
+            pointCoords[i * 2] = point.x * scaleX;
+            pointCoords[i * 2 + 1] = point.y * scaleY;
+            pointLabels[i] = point.label;
+        }
+        // Sentinel token expected by SAM decoder prompt format.
+        pointCoords[promptCount * 2] = 0;
+        pointCoords[promptCount * 2 + 1] = 0;
+        pointLabels[promptCount] = -1;
         const maskInput = new Float32Array(SAM2_MASK_SIZE * SAM2_MASK_SIZE);
         const hasMaskInput = new Float32Array([0]);
 
-        const pointCoordsTensor = new ort.Tensor('float32', pointCoords, [1, 2, 2]);
-        const pointLabelsTensor = new ort.Tensor('float32', pointLabels, [1, 2]);
+        const pointCoordsTensor = new ort.Tensor('float32', pointCoords, [1, promptCount + 1, 2]);
+        const pointLabelsTensor = new ort.Tensor('float32', pointLabels, [1, promptCount + 1]);
         const maskInputTensor = new ort.Tensor('float32', maskInput, [1, 1, SAM2_MASK_SIZE, SAM2_MASK_SIZE]);
         const hasMaskInputTensor = new ort.Tensor('float32', hasMaskInput, [1]);
 
@@ -522,6 +728,7 @@ export class Sam2SliceService {
         iouPredictions: ort.Tensor,
         width: number,
         height: number,
+        maskThreshold: number,
     ): Promise<{ selectedIndices: Uint32Array; iouScore: number }> {
         const masksData = await this.readFloat32TensorData(masks);
         const iouData = await this.readFloat32TensorData(iouPredictions);
@@ -550,7 +757,7 @@ export class Sam2SliceService {
             for (let x = 0; x < width; x++) {
                 const mx = Math.min(maskWidth - 1, Math.floor((x * maskWidth) / width));
                 const maskLogit = masksData[bestOffset + rowBase + mx];
-                if (maskLogit > this.maskThreshold) {
+                if (maskLogit > maskThreshold) {
                     out[count++] = dstRow + x;
                 }
             }
@@ -560,6 +767,79 @@ export class Sam2SliceService {
             selectedIndices: out.slice(0, count),
             iouScore: Number.isFinite(bestIou) ? bestIou : 0,
         };
+    }
+
+    private filterPreviewSmallIslands(indices: Uint32Array, width: number, height: number): Uint32Array {
+        if (indices.length === 0 || width <= 0 || height <= 0) return indices;
+        const totalPixels = width * height;
+        if (totalPixels <= 0) return indices;
+        const minComponentSize = Math.max(12, Math.min(96, Math.round(totalPixels * 0.00005)));
+
+        const mask = new Uint8Array(totalPixels);
+        for (let i = 0; i < indices.length; i++) {
+            const idx = indices[i];
+            if (idx >= 0 && idx < totalPixels) {
+                mask[idx] = 1;
+            }
+        }
+
+        const visited = new Uint8Array(totalPixels);
+        const queue = new Int32Array(indices.length);
+        for (let i = 0; i < indices.length; i++) {
+            const start = indices[i];
+            if (start < 0 || start >= totalPixels) continue;
+            if (mask[start] === 0 || visited[start] !== 0) continue;
+
+            let head = 0;
+            let tail = 0;
+            queue[tail++] = start;
+            visited[start] = 1;
+
+            while (head < tail) {
+                const current = queue[head++];
+                const x = current % width;
+
+                const left = current - 1;
+                if (x > 0 && mask[left] !== 0 && visited[left] === 0) {
+                    visited[left] = 1;
+                    queue[tail++] = left;
+                }
+
+                const right = current + 1;
+                if (x + 1 < width && mask[right] !== 0 && visited[right] === 0) {
+                    visited[right] = 1;
+                    queue[tail++] = right;
+                }
+
+                const up = current - width;
+                if (up >= 0 && mask[up] !== 0 && visited[up] === 0) {
+                    visited[up] = 1;
+                    queue[tail++] = up;
+                }
+
+                const down = current + width;
+                if (down < totalPixels && mask[down] !== 0 && visited[down] === 0) {
+                    visited[down] = 1;
+                    queue[tail++] = down;
+                }
+            }
+
+            if (tail < minComponentSize) {
+                for (let j = 0; j < tail; j++) {
+                    mask[queue[j]] = 0;
+                }
+            }
+        }
+
+        const filtered = new Uint32Array(indices.length);
+        let count = 0;
+        for (let i = 0; i < indices.length; i++) {
+            const idx = indices[i];
+            if (idx >= 0 && idx < totalPixels && mask[idx] !== 0) {
+                filtered[count++] = idx;
+            }
+        }
+        return filtered.slice(0, count);
     }
 
     private trimCache(): void {

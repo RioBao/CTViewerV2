@@ -1405,6 +1405,40 @@ button.active {
     z-index: 10;
 }
 
+.smart-prompt-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 11;
+}
+
+.smart-prompt-marker {
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    margin-left: -8px;
+    margin-top: -8px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.9);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 800;
+    line-height: 1;
+    color: #f4f9ff;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.42);
+}
+
+.smart-prompt-marker.positive {
+    background: rgba(28, 184, 117, 0.84);
+}
+
+.smart-prompt-marker.negative {
+    background: rgba(228, 76, 76, 0.84);
+}
+
 .info-bar {
     background: rgba(18, 22, 29, 0.96);
     border-top: 1px solid var(--sep);
