@@ -3098,7 +3098,7 @@ export class ViewerApp {
         tolerance: number;
     }): Promise<RegionGrowSliceResult> {
         if (this.gpu?.isLost) {
-            this.segmentationGpuComputeFailed = true;
+            this.disableRegionGrowWebGpu('WebGPU device is lost. Falling back to worker backend.');
         }
         if (this.segmentationGpuCompute && !this.segmentationGpuComputeFailed) {
             try {
@@ -3106,8 +3106,7 @@ export class ViewerApp {
                 const selected = await this.segmentationGpuCompute.runRegionGrowSlice(task);
                 const elapsedMs = performance.now() - startedAt;
                 if (elapsedMs > REGION_GROW_GPU_DISABLE_AFTER_MS) {
-                    this.segmentationGpuComputeFailed = true;
-                    console.warn(
+                    this.disableRegionGrowWebGpu(
                         `WebGPU region grow is too slow on this GPU (${elapsedMs.toFixed(1)}ms slice). Falling back to worker for this session.`,
                     );
                 }
@@ -3117,8 +3116,7 @@ export class ViewerApp {
                     elapsedMs,
                 };
             } catch (error) {
-                this.segmentationGpuComputeFailed = true;
-                console.warn('WebGPU region grow failed; falling back to worker path.', error);
+                this.disableRegionGrowWebGpu('WebGPU region grow failed; falling back to worker path.', error);
             }
         }
         const startedAt = performance.now();
@@ -3128,6 +3126,13 @@ export class ViewerApp {
             backend: 'worker',
             elapsedMs: performance.now() - startedAt,
         };
+    }
+
+    private disableRegionGrowWebGpu(reason: string, error?: unknown): void {
+        if (!this.segmentationGpuComputeFailed) {
+            console.warn(reason, error);
+        }
+        this.segmentationGpuComputeFailed = true;
     }
 
     private logRegionGrowPerf(

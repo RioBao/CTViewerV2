@@ -5,7 +5,6 @@ const SAM2_INPUT_SIZE = 1024;
 const SAM2_MASK_SIZE = 256;
 const SAM2_CACHE_LIMIT = 8;
 const DEFAULT_MASK_THRESHOLD = 0;
-const SAM2_FORCE_WASM_STORAGE_KEY = 'viewer.sam2.forceWasm';
 
 const DEFAULT_MODEL_BASE_URL = getViteEnvString('VITE_SAM2_MODEL_BASE_URL') ?? 'https://huggingface.co/SharpAI/sam2-hiera-tiny-onnx/resolve/main';
 const DEFAULT_ENCODER_URL = getViteEnvString('VITE_SAM2_ENCODER_URL') ?? `${DEFAULT_MODEL_BASE_URL}/encoder.with_runtime_opt.ort`;
@@ -150,28 +149,6 @@ function configureOrtWasmRuntime(): void {
     isOrtWasmConfigured = true;
 }
 
-function readForceWasmPreference(): boolean {
-    try {
-        if (typeof localStorage === 'undefined') return false;
-        return localStorage.getItem(SAM2_FORCE_WASM_STORAGE_KEY) === '1';
-    } catch {
-        return false;
-    }
-}
-
-function writeForceWasmPreference(force: boolean): void {
-    try {
-        if (typeof localStorage === 'undefined') return;
-        if (force) {
-            localStorage.setItem(SAM2_FORCE_WASM_STORAGE_KEY, '1');
-        } else {
-            localStorage.removeItem(SAM2_FORCE_WASM_STORAGE_KEY);
-        }
-    } catch {
-        // Ignore storage failures.
-    }
-}
-
 /**
  * Slice-based SAM2 service.
  * - Caches image embeddings per (volume, axis, slice, window)
@@ -195,7 +172,6 @@ export class Sam2SliceService {
         this.maskThreshold = Number.isFinite(options.maskThreshold ?? NaN)
             ? Number(options.maskThreshold)
             : DEFAULT_MASK_THRESHOLD;
-        this.preferWebGpu = !readForceWasmPreference();
     }
 
     isUsingWasmFallback(): boolean {
@@ -530,7 +506,6 @@ export class Sam2SliceService {
         const message = error instanceof Error ? error.message : String(error);
         console.warn(`[SmartRegion] ORT WebGPU failed, switching SAM2 to WASM fallback. ${message}`);
         this.preferWebGpu = false;
-        writeForceWasmPreference(true);
         this.clearEmbeddingCache();
         this.encoderSession = null;
         this.decoderSession = null;
