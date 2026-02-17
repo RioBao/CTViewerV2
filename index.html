@@ -132,8 +132,8 @@
                     <div class="tool-mode-panel" id="toolModePanel" aria-hidden="true">
                         <div class="tool-mode-view" id="toolModeSegmentation">
                             <div class="tool-mode-title">Tool Parameters</div>
-                            <div class="control-row" id="segBrushRow">
-                                <label>Brush Action</label>
+                            <div class="control-row" id="segActionRow">
+                                <label>Action</label>
                                 <div class="seg-tool-buttons two-col">
                                     <button type="button" id="segBrushDrawBtn" class="seg-tool-button seg-icon-only active" title="Draw" aria-label="Draw">
                                         <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -147,6 +147,8 @@
                                         </svg>
                                     </button>
                                 </div>
+                            </div>
+                            <div class="control-row" id="segBrushRow">
                                 <label for="segBrushSize">Brush Size <span id="segBrushSizeValue">8</span></label>
                                 <input type="range" id="segBrushSize" min="1" max="64" step="1" value="8">
                             </div>
@@ -155,6 +157,15 @@
                                 <input type="number" id="segThresholdMin" value="0">
                                 <label for="segThresholdMax">Threshold Max</label>
                                 <input type="number" id="segThresholdMax" value="0">
+                                <label for="segThresholdRangeMin">Threshold Range</label>
+                                <div class="seg-threshold-range" id="segThresholdRange">
+                                    <div id="segThresholdRangeSelection" class="seg-threshold-range-selection"></div>
+                                    <div id="segThresholdMarkerOtsu2" class="seg-threshold-range-marker otsu2" title="2-class split"></div>
+                                    <div id="segThresholdMarkerOtsu3A" class="seg-threshold-range-marker otsu3" title="3-class split A"></div>
+                                    <div id="segThresholdMarkerOtsu3B" class="seg-threshold-range-marker otsu3" title="3-class split B"></div>
+                                    <input type="range" id="segThresholdRangeMin" min="0" max="1" step="0.001" value="0">
+                                    <input type="range" id="segThresholdRangeMax" min="0" max="1" step="0.001" value="1">
+                                </div>
                             </div>
                             <div class="control-row" id="segGrowRow" style="display: none;">
                                 <label for="segGrowTolerance">Grow Tolerance</label>
@@ -180,7 +191,7 @@
                                         <button id="segAIClearPreviewBtn" class="seg-action-btn" type="button" disabled>Clear Preview</button>
                                         <button id="segAIClearCacheBtn" class="seg-action-btn" type="button">Clear AI Cache</button>
                                     </div>
-                                    <div class="seg-ai-hint">Tip: Shift+Click sends a negative point.</div>
+                                    <div class="seg-ai-hint">Tip: action mode sets default prompt (+/-), Shift forces -, Ctrl/Cmd forces +.</div>
                                 </div>
                             </div>
                         </div>

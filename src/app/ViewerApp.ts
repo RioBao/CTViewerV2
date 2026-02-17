@@ -33,6 +33,8 @@ const MASK_3D_SYNC_DRAG_MS = 140;
 const REGION_GROW_GPU_DISABLE_AFTER_MS = 900;
 const ENABLE_REGION_GROW_WEBGPU = false;
 const SMART_REGION_STATUS_DEFAULT = 'Click to add SAM2 + prompts. Shift+click adds - prompts.';
+const THRESHOLD_AUTO_SAMPLE_CAP = 65_536;
+const THRESHOLD_AUTO_HISTOGRAM_BINS = 256;
 
 interface ActiveRoiStatsAccumulator {
     roiId: string;
@@ -126,6 +128,136 @@ function createRegionGrowPerfStats(): RegionGrowPerfStats {
     return { slices: 0, selected: 0, elapsedMs: 0 };
 }
 
+interface OtsuThresholdStats {
+    min: number;
+    max: number;
+    binaryThreshold: number;
+    lowerThreshold: number;
+    upperThreshold: number;
+}
+
+function computeOtsuThresholdStats(
+    values: Float32Array,
+    sampleCap: number,
+    histogramBinsRaw: number,
+): OtsuThresholdStats | null {
+    if (values.length === 0) return null;
+    const sampleCount = Math.max(1, Math.min(values.length, sampleCap));
+    const sample = new Float32Array(sampleCount);
+    let min = Infinity;
+    let max = -Infinity;
+    if (values.length <= sampleCount) {
+        for (let i = 0; i < sampleCount; i++) {
+            const value = values[i];
+            sample[i] = value;
+            if (value < min) min = value;
+            if (value > max) max = value;
+        }
+    } else {
+        const scale = (values.length - 1) / Math.max(1, sampleCount - 1);
+        for (let i = 0; i < sampleCount; i++) {
+            const value = values[Math.floor(i * scale)];
+            sample[i] = value;
+            if (value < min) min = value;
+            if (value > max) max = value;
+        }
+    }
+    if (!(max > min) || !Number.isFinite(min) || !Number.isFinite(max)) {
+        return null;
+    }
+
+    const histogramBins = Math.max(16, Math.floor(histogramBinsRaw));
+    const histogram = new Float64Array(histogramBins);
+    const range = max - min;
+    const scale = (histogramBins - 1) / range;
+    for (let i = 0; i < sample.length; i++) {
+        const value = sample[i];
+        const bin = Math.max(0, Math.min(histogramBins - 1, Math.floor((value - min) * scale)));
+        histogram[bin] += 1;
+    }
+    const total = sample.length;
+
+    // Binary Otsu threshold.
+    let bestBinaryScore = -Infinity;
+    let bestBinaryThreshold = 0;
+    let prefixWeight = 0;
+    let prefixMean = 0;
+    let totalMean = 0;
+    for (let i = 0; i < histogramBins; i++) {
+        totalMean += i * histogram[i];
+    }
+    for (let t = 0; t < histogramBins - 1; t++) {
+        const count = histogram[t];
+        prefixWeight += count;
+        prefixMean += t * count;
+        const suffixWeight = total - prefixWeight;
+        if (prefixWeight <= 0 || suffixWeight <= 0) continue;
+        const mean0 = prefixMean / prefixWeight;
+        const mean1 = (totalMean - prefixMean) / suffixWeight;
+        const score = prefixWeight * suffixWeight * (mean0 - mean1) * (mean0 - mean1);
+        if (score > bestBinaryScore) {
+            bestBinaryScore = score;
+            bestBinaryThreshold = t;
+        }
+    }
+
+    // Multi-Otsu (3 classes) thresholds.
+    const omega = new Float64Array(histogramBins);
+    const mu = new Float64Array(histogramBins);
+    let omegaAcc = 0;
+    let muAcc = 0;
+    for (let i = 0; i < histogramBins; i++) {
+        const p = histogram[i] / total;
+        omegaAcc += p;
+        muAcc += p * i;
+        omega[i] = omegaAcc;
+        mu[i] = muAcc;
+    }
+    const muTotal = mu[histogramBins - 1];
+    const eps = 1e-8;
+    let bestMultiScore = -Infinity;
+    let bestT1 = -1;
+    let bestT2 = -1;
+    for (let t1 = 0; t1 < histogramBins - 2; t1++) {
+        const w0 = omega[t1];
+        if (w0 <= eps) continue;
+        const m0 = mu[t1] / w0;
+        for (let t2 = t1 + 1; t2 < histogramBins - 1; t2++) {
+            const w1 = omega[t2] - omega[t1];
+            const w2 = 1 - omega[t2];
+            if (w1 <= eps || w2 <= eps) continue;
+            const m1 = (mu[t2] - mu[t1]) / w1;
+            const m2 = (muTotal - mu[t2]) / w2;
+            const score = w0 * (m0 - muTotal) * (m0 - muTotal)
+                + w1 * (m1 - muTotal) * (m1 - muTotal)
+                + w2 * (m2 - muTotal) * (m2 - muTotal);
+            if (score > bestMultiScore) {
+                bestMultiScore = score;
+                bestT1 = t1;
+                bestT2 = t2;
+            }
+        }
+    }
+
+    if (bestT1 < 0 || bestT2 <= bestT1) {
+        const span = Math.max(1, Math.floor(histogramBins / 6));
+        bestT1 = Math.max(0, bestBinaryThreshold - span);
+        bestT2 = Math.min(histogramBins - 1, bestBinaryThreshold + span);
+        if (bestT2 <= bestT1) bestT2 = Math.min(histogramBins - 1, bestT1 + 1);
+    }
+
+    const thresholdFromBin = (bin: number): number => min + ((bin + 1) / histogramBins) * range;
+    const lowerThreshold = thresholdFromBin(bestT1);
+    const upperThreshold = thresholdFromBin(bestT2);
+    return {
+        min,
+        max,
+        binaryThreshold: thresholdFromBin(bestBinaryThreshold),
+        lowerThreshold: Math.min(lowerThreshold, upperThreshold),
+        upperThreshold: Math.max(lowerThreshold, upperThreshold),
+    };
+}
+
 /**
  * Top-level application orchestrator.
  * Manages WebGPU renderers, user interaction, histogram, and crosshairs.
@@ -167,6 +299,9 @@ export class ViewerApp {
     private smartRegionService: Sam2SliceService | null = null;
     private smartRegionPreviewOnly = true;
     private smartRegionPreview: SmartRegionPreview | null = null;
+    private thresholdGuideCacheKey: string | null = null;
+    private thresholdGuideCacheValue: OtsuThresholdStats | null = null;
+    private actionShortcutOverride: 0 | 1 | null = null;
     private regionGrowPerfTotals: Record<RegionGrowBackend, RegionGrowPerfStats> = {
         webgpu: createRegionGrowPerfStats(),
         worker: createRegionGrowPerfStats(),
@@ -1047,6 +1182,117 @@ export class ViewerApp {
         }
     }
 
+    private getThresholdGuideForActiveSlice(): OtsuThresholdStats | null {
+        if (!this.volume) return null;
+        const axis = this.activeAxis;
+        const sliceIndex = this.uiState.state.slices[axis];
+        const volumeKey = this.buildSmartRegionVolumeKey(this.volume);
+        const cacheKey = `${volumeKey}|${axis}|${sliceIndex}`;
+        if (cacheKey === this.thresholdGuideCacheKey) {
+            return this.thresholdGuideCacheValue;
+        }
+        const slice = this.volume.getSlice(axis, sliceIndex);
+        const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
+        const stats = computeOtsuThresholdStats(values, THRESHOLD_AUTO_SAMPLE_CAP, THRESHOLD_AUTO_HISTOGRAM_BINS);
+        this.thresholdGuideCacheKey = cacheKey;
+        this.thresholdGuideCacheValue = stats;
+        return stats;
+    }
+
+    private syncThresholdRangeUI(seg: SegmentationSettings): void {
+        const minSlider = document.getElementById('segThresholdRangeMin') as HTMLInputElement | null;
+        const maxSlider = document.getElementById('segThresholdRangeMax') as HTMLInputElement | null;
+        const selection = document.getElementById('segThresholdRangeSelection') as HTMLDivElement | null;
+        const markerOtsu2 = document.getElementById('segThresholdMarkerOtsu2') as HTMLDivElement | null;
+        const markerOtsu3A = document.getElementById('segThresholdMarkerOtsu3A') as HTMLDivElement | null;
+        const markerOtsu3B = document.getElementById('segThresholdMarkerOtsu3B') as HTMLDivElement | null;
+        if (!minSlider || !maxSlider || !selection || !markerOtsu2 || !markerOtsu3A || !markerOtsu3B) {
+            return;
+        }
+
+        const rangeInfo = this.getSegmentationInputRange(seg);
+        const step = this.getSegmentationNumberStep(rangeInfo.range);
+        const lo = rangeInfo.min;
+        const hi = rangeInfo.max;
+        const safeRange = Math.max(1e-6, hi - lo);
+
+        minSlider.min = this.formatSegmentationInputValue(lo, step);
+        minSlider.max = this.formatSegmentationInputValue(hi, step);
+        minSlider.step = this.formatSegmentationInputValue(step, step);
+        minSlider.value = this.formatSegmentationInputValue(seg.thresholdMin, step);
+
+        maxSlider.min = this.formatSegmentationInputValue(lo, step);
+        maxSlider.max = this.formatSegmentationInputValue(hi, step);
+        maxSlider.step = this.formatSegmentationInputValue(step, step);
+        maxSlider.value = this.formatSegmentationInputValue(seg.thresholdMax, step);
+
+        const curMin = Math.min(seg.thresholdMin, seg.thresholdMax);
+        const curMax = Math.max(seg.thresholdMin, seg.thresholdMax);
+        const leftPct = ((curMin - lo) / safeRange) * 100;
+        const widthPct = ((curMax - curMin) / safeRange) * 100;
+        selection.style.left = `${Math.max(0, Math.min(100, leftPct))}%`;
+        selection.style.width = `${Math.max(0, Math.min(100, widthPct))}%`;
+
+        const stats = this.getThresholdGuideForActiveSlice();
+        if (!stats) {
+            markerOtsu2.style.display = 'none';
+            markerOtsu3A.style.display = 'none';
+            markerOtsu3B.style.display = 'none';
+            return;
+        }
+
+        const marker2Pct = ((stats.binaryThreshold - lo) / safeRange) * 100;
+        const marker3APct = ((stats.lowerThreshold - lo) / safeRange) * 100;
+        const marker3BPct = ((stats.upperThreshold - lo) / safeRange) * 100;
+        markerOtsu2.style.display = '';
+        markerOtsu3A.style.display = '';
+        markerOtsu3B.style.display = '';
+        markerOtsu2.style.left = `${Math.max(0, Math.min(100, marker2Pct))}%`;
+        markerOtsu3A.style.left = `${Math.max(0, Math.min(100, marker3APct))}%`;
+        markerOtsu3B.style.left = `${Math.max(0, Math.min(100, marker3BPct))}%`;
+    }
+
+    private onThresholdSliderInput(changed: 'min' | 'max'): void {
+        const minSlider = document.getElementById('segThresholdRangeMin') as HTMLInputElement | null;
+        const maxSlider = document.getElementById('segThresholdRangeMax') as HTMLInputElement | null;
+        if (!minSlider || !maxSlider) return;
+        const step = Math.max(1e-6, parseFloat(minSlider.step) || 1e-6);
+        const lo = parseFloat(minSlider.min);
+        const hi = parseFloat(minSlider.max);
+        const clampedLo = Number.isFinite(lo) ? lo : -Infinity;
+        const clampedHi = Number.isFinite(hi) ? hi : Infinity;
+        let minValue = parseFloat(minSlider.value);
+        let maxValue = parseFloat(maxSlider.value);
+        if (!Number.isFinite(minValue)) minValue = 0;
+        if (!Number.isFinite(maxValue)) maxValue = minValue;
+
+        if (changed === 'min' && minValue > maxValue - step) {
+            maxValue = minValue + step;
+        } else if (changed === 'max' && maxValue < minValue + step) {
+            minValue = maxValue - step;
+        }
+
+        minValue = Math.max(clampedLo, Math.min(clampedHi, minValue));
+        maxValue = Math.max(clampedLo, Math.min(clampedHi, maxValue));
+
+        if (maxValue - minValue < step) {
+            if (changed === 'min') {
+                maxValue = Math.min(clampedHi, minValue + step);
+                minValue = Math.max(clampedLo, maxValue - step);
+            } else {
+                minValue = Math.max(clampedLo, maxValue - step);
+                maxValue = Math.min(clampedHi, minValue + step);
+            }
+        }
+
+        minSlider.value = String(minValue);
+        maxSlider.value = String(maxValue);
+        this.setSegmentationState({
+            thresholdMin: Math.min(minValue, maxValue),
+            thresholdMax: Math.max(minValue, maxValue),
+        });
+    }
+
     private rgb01ToHex(color: [number, number, number]): string {
         const toHex = (v: number) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
         return `#${toHex(color[0])}${toHex(color[1])}${toHex(color[2])}`;
@@ -1310,6 +1556,8 @@ export class ViewerApp {
         const segBrushSizeValue = document.getElementById('segBrushSizeValue');
         const segThresholdMin = document.getElementById('segThresholdMin') as HTMLInputElement | null;
         const segThresholdMax = document.getElementById('segThresholdMax') as HTMLInputElement | null;
+        const segThresholdRangeMin = document.getElementById('segThresholdRangeMin') as HTMLInputElement | null;
+        const segThresholdRangeMax = document.getElementById('segThresholdRangeMax') as HTMLInputElement | null;
         const segGrowTolerance = document.getElementById('segGrowTolerance') as HTMLInputElement | null;
         const segSliceRadius = document.getElementById('segSliceRadius') as HTMLInputElement | null;
         const exportBtn = document.getElementById('segExportRoiBtn') as HTMLButtonElement | null;
@@ -1330,13 +1578,17 @@ export class ViewerApp {
         if (segBrushSize) segBrushSize.value = String(seg.brushRadius);
         if (segBrushSizeValue) segBrushSizeValue.textContent = String(seg.brushRadius);
         this.applySegmentationNumericInputConfig(seg, segThresholdMin, segThresholdMax, segGrowTolerance);
+        this.syncThresholdRangeUI(seg);
         if (segSliceRadius) segSliceRadius.value = String(seg.regionGrowSliceRadius);
+        const autoThresholdDisabled = !this.volume;
+        if (segThresholdRangeMin) segThresholdRangeMin.disabled = autoThresholdDisabled;
+        if (segThresholdRangeMax) segThresholdRangeMax.disabled = autoThresholdDisabled;
         if (this.segmentationPinBtn) {
             this.segmentationPinBtn.classList.toggle('active', seg.isPinned);
         }
         this.updateSegmentationToolRows(seg.activeTool);
         this.updateSegmentationToolButtons(seg.activeTool);
-        this.updateSegmentationBrushButtons(seg.paintValue);
+        this.refreshSegmentationActionButtons();
         if (exportBtn) exportBtn.disabled = !active;
         if (importBtn) importBtn.disabled = !this.volume;
         if (exportSegBtn) exportSegBtn.disabled = !this.volume || !this.maskVolume;
@@ -2003,7 +2255,7 @@ export class ViewerApp {
         if (patch.tool !== undefined || patch.paintValue !== undefined || patch.activeTool !== undefined) {
             this.updateSegmentationToolRows(next.activeTool);
             this.updateSegmentationToolButtons(next.activeTool);
-            this.updateSegmentationBrushButtons(next.paintValue);
+            this.refreshSegmentationActionButtons();
         }
         if (patch.isPinned !== undefined) {
             this.updateSegmentationPanelVisibility();
@@ -2444,6 +2696,7 @@ export class ViewerApp {
         this.sliceIndicators.xy.textContent = `XY: ${s.xy + 1}/${nz}`;
         this.sliceIndicators.xz.textContent = `XZ: ${s.xz + 1}/${ny}`;
         this.sliceIndicators.yz.textContent = `YZ: ${s.yz + 1}/${nx}`;
+        this.syncThresholdRangeUI(this.uiState.state.segmentation);
     }
 
     private maxSlice(axis: ViewAxis): number {
@@ -2482,6 +2735,8 @@ export class ViewerApp {
         this.segmentationDragAxis = null;
         this.activePaintStrokeId = null;
         this.segmentationWorkerBusy = false;
+        this.thresholdGuideCacheKey = null;
+        this.thresholdGuideCacheValue = null;
         this.smartRegionService?.clearEmbeddingCache();
         this.clearSmartRegionPreview();
         this.setSmartRegionStatus(SMART_REGION_STATUS_DEFAULT);
@@ -2665,26 +2920,43 @@ export class ViewerApp {
         return this.uiState.state.segmentation.paintValue;
     }
 
-    private shouldUseThresholdTool(): boolean {
+    private getActionShortcutOverrideFromModifiers(modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean }): 0 | 1 | null {
+        if (modifiers?.shiftKey) return 0;
+        if (modifiers?.ctrlKey || modifiers?.metaKey) return 1;
+        return null;
+    }
+
+    private updateActionShortcutOverride(modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean }): void {
+        const next = this.getActionShortcutOverrideFromModifiers(modifiers);
+        if (next === this.actionShortcutOverride) return;
+        this.actionShortcutOverride = next;
+        this.refreshSegmentationActionButtons();
+    }
+
+    private shouldUseThresholdTool(modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean }): boolean {
         const seg = this.uiState.state.segmentation;
         const active = this.getActiveRoi();
+        const paintValue = this.getEffectiveBrushPaintValue(modifiers);
+        const canErase = paintValue === 0;
+        const canPaint = paintValue === 1 && !!active && !active.locked;
         return !!this.maskVolume
             && this.isSegmentationMode()
             && seg.enabled
             && seg.tool === 'threshold'
-            && !!active
-            && !active.locked;
+            && (canErase || canPaint);
     }
 
-    private shouldUseRegionGrowTool(): boolean {
+    private shouldUseRegionGrowTool(modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean }): boolean {
         const seg = this.uiState.state.segmentation;
         const active = this.getActiveRoi();
+        const paintValue = this.getEffectiveBrushPaintValue(modifiers);
+        const canErase = paintValue === 0;
+        const canPaint = paintValue === 1 && !!active && !active.locked;
         return !!this.maskVolume
             && this.isSegmentationMode()
             && seg.enabled
             && seg.tool === 'region-grow'
-            && !!active
-            && !active.locked;
+            && (canErase || canPaint);
     }
 
     private shouldUseSmartRegionTool(): boolean {
@@ -2997,6 +3269,25 @@ export class ViewerApp {
         this.refreshSegmentationOverlayUI();
     }
 
+    private applySelectionIndicesToClass(
+        axis: ViewAxis,
+        sliceIndex: number,
+        width: number,
+        height: number,
+        selectedIndices: Uint32Array,
+        classId: number,
+    ): number {
+        const op = createApplySliceSelectionOp({
+            axis,
+            sliceIndex,
+            width,
+            height,
+            selectedIndices,
+            classId,
+        });
+        return this.applySegmentationOp(op);
+    }
+
     private applySelectionIndicesToActiveRoi(
         axis: ViewAxis,
         sliceIndex: number,
@@ -3006,15 +3297,7 @@ export class ViewerApp {
     ): number {
         const active = this.getActiveRoi();
         if (!active) return 0;
-        const op = createApplySliceSelectionOp({
-            axis,
-            sliceIndex,
-            width,
-            height,
-            selectedIndices,
-            classId: active.classId,
-        });
-        return this.applySegmentationOp(op);
+        return this.applySelectionIndicesToClass(axis, sliceIndex, width, height, selectedIndices, active.classId);
     }
 
     private getSliceIndicesWithRadius(axis: ViewAxis, centerSlice: number, radius: number): number[] {
@@ -3072,15 +3355,25 @@ export class ViewerApp {
         return changed;
     }
 
-    private async runThresholdToolAtClient(axis: ViewAxis, clientX: number, clientY: number): Promise<void> {
+    private async runThresholdToolAtClient(
+        axis: ViewAxis,
+        clientX: number,
+        clientY: number,
+        modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean },
+    ): Promise<void> {
         if (this.segmentationWorkerBusy || !this.volume) return;
         const hit = this.getSliceHitFromClient(axis, clientX, clientY);
         if (!hit) return;
         const active = this.getActiveRoi();
-        if (!active || active.locked) return;
+        const paintValue = this.getEffectiveBrushPaintValue(modifiers);
+        const eraseMode = paintValue === 0;
+        if (!eraseMode && (!active || active.locked)) return;
+        const classId = eraseMode ? 0 : active!.classId;
         const seg = this.uiState.state.segmentation;
         this.segmentationWorkerBusy = true;
-        this.setActiveRoiBusy(active.id, true);
+        if (active && !eraseMode) {
+            this.setActiveRoiBusy(active.id, true);
+        }
         try {
             const targetSlices = this.getSliceIndicesWithRadius(axis, hit.sliceIndex, seg.regionGrowSliceRadius);
             let changedTotal = 0;
@@ -3094,7 +3387,7 @@ export class ViewerApp {
                     min: Math.min(seg.thresholdMin, seg.thresholdMax),
                     max: Math.max(seg.thresholdMin, seg.thresholdMax),
                 });
-                changedTotal += this.applySelectionIndicesToActiveRoi(axis, sliceIndex, slice.width, slice.height, selected);
+                changedTotal += this.applySelectionIndicesToClass(axis, sliceIndex, slice.width, slice.height, selected, classId);
             }
             if (changedTotal > 0) {
                 this.invalidateActiveRoiStats();
@@ -3107,20 +3400,32 @@ export class ViewerApp {
             console.error('Threshold tool failed:', error);
         } finally {
             this.segmentationWorkerBusy = false;
-            this.setActiveRoiBusy(active.id, false);
+            if (active && !eraseMode) {
+                this.setActiveRoiBusy(active.id, false);
+            }
             this.refreshSmartRegionPreviewControls();
         }
     }
 
-    private async runRegionGrowToolAtClient(axis: ViewAxis, clientX: number, clientY: number): Promise<void> {
+    private async runRegionGrowToolAtClient(
+        axis: ViewAxis,
+        clientX: number,
+        clientY: number,
+        modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean },
+    ): Promise<void> {
         if (this.segmentationWorkerBusy || !this.volume) return;
         const hit = this.getSliceHitFromClient(axis, clientX, clientY);
         if (!hit) return;
         const active = this.getActiveRoi();
-        if (!active || active.locked) return;
+        const paintValue = this.getEffectiveBrushPaintValue(modifiers);
+        const eraseMode = paintValue === 0;
+        if (!eraseMode && (!active || active.locked)) return;
+        const classId = eraseMode ? 0 : active!.classId;
         const seg = this.uiState.state.segmentation;
         this.segmentationWorkerBusy = true;
-        this.setActiveRoiBusy(active.id, true);
+        if (active && !eraseMode) {
+            this.setActiveRoiBusy(active.id, true);
+        }
         const callStartedAt = performance.now();
         const callStats: Record<RegionGrowBackend, RegionGrowPerfStats> = {
             webgpu: createRegionGrowPerfStats(),
@@ -3148,7 +3453,7 @@ export class ViewerApp {
                 stats.slices += 1;
                 stats.selected += result.selected.length;
                 stats.elapsedMs += result.elapsedMs;
-                changedTotal += this.applySelectionIndicesToActiveRoi(axis, sliceIndex, slice.width, slice.height, result.selected);
+                changedTotal += this.applySelectionIndicesToClass(axis, sliceIndex, slice.width, slice.height, result.selected, classId);
             }
             this.logRegionGrowPerf(axis, targetSliceCount, changedTotal, performance.now() - callStartedAt, callStats);
             if (changedTotal > 0) {
@@ -3162,7 +3467,9 @@ export class ViewerApp {
             console.error('Region grow tool failed:', error);
         } finally {
             this.segmentationWorkerBusy = false;
-            this.setActiveRoiBusy(active.id, false);
+            if (active && !eraseMode) {
+                this.setActiveRoiBusy(active.id, false);
+            }
             this.refreshSmartRegionPreviewControls();
         }
     }
@@ -3171,7 +3478,7 @@ export class ViewerApp {
         axis: ViewAxis,
         clientX: number,
         clientY: number,
-        modifiers?: { shiftKey?: boolean },
+        modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean },
     ): Promise<void> {
         if (this.segmentationWorkerBusy || !this.volume) return;
         const hit = this.getSliceHitFromClient(axis, clientX, clientY);
@@ -3179,7 +3486,7 @@ export class ViewerApp {
         const active = this.getActiveRoi();
         if (!active || active.locked) return;
 
-        const pointLabel: 0 | 1 = modifiers?.shiftKey ? 0 : 1;
+        const pointLabel = this.getEffectiveBrushPaintValue(modifiers);
         const volume = this.volume;
         const slice = volume.getSlice(axis, hit.sliceIndex);
         const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
@@ -3457,7 +3764,9 @@ export class ViewerApp {
 
             // Track active view
             canvas.addEventListener('mousedown', (e) => {
+                this.updateActionShortcutOverride(e);
                 this.activeAxis = axis;
+                this.syncThresholdRangeUI(this.uiState.state.segmentation);
                 if (!this.volume) return;
 
                 if (this.isMeasuringMode()) {
@@ -3478,12 +3787,12 @@ export class ViewerApp {
                     this.paintBrushAtClient(axis, e.clientX, e.clientY, e);
                     return;
                 }
-                if (this.shouldUseThresholdTool()) {
-                    void this.runThresholdToolAtClient(axis, e.clientX, e.clientY);
+                if (this.shouldUseThresholdTool(e)) {
+                    void this.runThresholdToolAtClient(axis, e.clientX, e.clientY, e);
                     return;
                 }
-                if (this.shouldUseRegionGrowTool()) {
-                    void this.runRegionGrowToolAtClient(axis, e.clientX, e.clientY);
+                if (this.shouldUseRegionGrowTool(e)) {
+                    void this.runRegionGrowToolAtClient(axis, e.clientX, e.clientY, e);
                     return;
                 }
                 if (this.shouldUseSmartRegionTool()) {
@@ -3586,6 +3895,7 @@ export class ViewerApp {
         }, { signal: this.globalAbort.signal });
 
         window.addEventListener('mouseup', (e) => {
+            this.updateActionShortcutOverride(e);
             // ROI release
             if (this.roiDragging && this.roiAxis) {
                 this.roiDragging = false;
@@ -4109,10 +4419,12 @@ export class ViewerApp {
     // ================================================================
 
     private updateSegmentationToolRows(activeTool: SegmentationSettings['activeTool']): void {
+        const actionRow = document.getElementById('segActionRow');
         const brushRow = document.getElementById('segBrushRow');
         const thresholdRow = document.getElementById('segThresholdRow');
         const growRow = document.getElementById('segGrowRow');
         const aiRow = document.getElementById('segAIRow');
+        if (actionRow) actionRow.style.display = '';
         if (brushRow) brushRow.style.display = activeTool === 'brush' ? '' : 'none';
         if (thresholdRow) thresholdRow.style.display = activeTool === 'threshold' ? '' : 'none';
         if (growRow) growRow.style.display = activeTool === 'region-grow' ? '' : 'none';
@@ -4130,7 +4442,9 @@ export class ViewerApp {
         if (aiBtn) aiBtn.classList.toggle('active', activeTool === 'smart-region');
     }
 
-    private updateSegmentationBrushButtons(paintValue: 0 | 1): void {
+    private refreshSegmentationActionButtons(): void {
+        const basePaintValue = this.uiState.state.segmentation.paintValue;
+        const paintValue = this.actionShortcutOverride ?? basePaintValue;
         const drawBtn = document.getElementById('segBrushDrawBtn');
         const eraseBtn = document.getElementById('segBrushEraseBtn');
         if (drawBtn) drawBtn.classList.toggle('active', paintValue === 1);
@@ -4265,6 +4579,8 @@ export class ViewerApp {
         const segBrushSizeValue = document.getElementById('segBrushSizeValue');
         const segThresholdMin = document.getElementById('segThresholdMin') as HTMLInputElement | null;
         const segThresholdMax = document.getElementById('segThresholdMax') as HTMLInputElement | null;
+        const segThresholdRangeMin = document.getElementById('segThresholdRangeMin') as HTMLInputElement | null;
+        const segThresholdRangeMax = document.getElementById('segThresholdRangeMax') as HTMLInputElement | null;
         const segGrowTolerance = document.getElementById('segGrowTolerance') as HTMLInputElement | null;
         const segSliceRadius = document.getElementById('segSliceRadius') as HTMLInputElement | null;
         const segShowOnlyActiveToggle = document.getElementById('segShowOnlyActiveToggle') as HTMLInputElement | null;
@@ -4282,10 +4598,15 @@ export class ViewerApp {
         if (segBrushSize) segBrushSize.value = String(seg.brushRadius);
         if (segBrushSizeValue) segBrushSizeValue.textContent = String(seg.brushRadius);
         this.applySegmentationNumericInputConfig(seg, segThresholdMin, segThresholdMax, segGrowTolerance);
+        this.syncThresholdRangeUI(seg);
         if (segSliceRadius) segSliceRadius.value = String(seg.regionGrowSliceRadius);
+        const autoThresholdDisabled = !this.volume;
+        if (segThresholdRangeMin) segThresholdRangeMin.disabled = autoThresholdDisabled;
+        if (segThresholdRangeMax) segThresholdRangeMax.disabled = autoThresholdDisabled;
         if (segShowOnlyActiveToggle) segShowOnlyActiveToggle.checked = seg.showOnlyActive;
         this.updateSegmentationToolRows(seg.activeTool);
         this.updateSegmentationToolButtons(seg.activeTool);
+        this.refreshSegmentationActionButtons();
         this.updateSegmentationPanelVisibility();
         this.setSmartRegionStatus(SMART_REGION_STATUS_DEFAULT);
         this.refreshSmartRegionPreviewControls();
@@ -4413,12 +4734,12 @@ export class ViewerApp {
         }
         if (segBrushDrawBtn) {
             segBrushDrawBtn.addEventListener('click', () => {
-                this.setSegmentationState({ tool: 'brush', paintValue: 1, activeTool: 'brush' });
+                this.setSegmentationState({ paintValue: 1 });
             });
         }
         if (segBrushEraseBtn) {
             segBrushEraseBtn.addEventListener('click', () => {
-                this.setSegmentationState({ tool: 'brush', paintValue: 0, activeTool: 'brush' });
+                this.setSegmentationState({ paintValue: 0 });
             });
         }
         if (segBrushSize) {
@@ -4436,6 +4757,16 @@ export class ViewerApp {
         if (segThresholdMax) {
             segThresholdMax.addEventListener('change', () => {
                 this.setSegmentationState({ thresholdMax: parseFloat(segThresholdMax.value) || 0 });
+            });
+        }
+        if (segThresholdRangeMin) {
+            segThresholdRangeMin.addEventListener('input', () => {
+                this.onThresholdSliderInput('min');
+            });
+        }
+        if (segThresholdRangeMax) {
+            segThresholdRangeMax.addEventListener('input', () => {
+                this.onThresholdSliderInput('max');
             });
         }
         if (segGrowTolerance) {
@@ -5369,6 +5700,7 @@ export class ViewerApp {
         fullscreenBtn.addEventListener('click', () => this.toggleFullscreen());
 
         document.addEventListener('keydown', (e) => {
+            this.updateActionShortcutOverride(e);
             const tag = (e.target as HTMLElement).tagName;
             if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
             const keyLower = e.key.toLowerCase();
@@ -5476,6 +5808,17 @@ export class ViewerApp {
                         }
                     }
                     break;
+            }
+        }, { signal: this.globalAbort.signal });
+        document.addEventListener('keyup', (e) => {
+            this.updateActionShortcutOverride(e);
+        }, { signal: this.globalAbort.signal });
+        window.addEventListener('blur', () => {
+            this.updateActionShortcutOverride();
+        }, { signal: this.globalAbort.signal });
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible') {
+                this.updateActionShortcutOverride();
             }
         }, { signal: this.globalAbort.signal });
     }
