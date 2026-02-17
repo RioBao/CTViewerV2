@@ -881,6 +881,23 @@ button.active {
     font-size: 0.68rem;
 }
 
+.seg-threshold-minmax {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.seg-threshold-minmax input[type='number'] {
+    flex: 1;
+    min-width: 0;
+    width: auto;
+}
+
+.seg-threshold-minmax > span {
+    color: #93a4bc;
+    flex-shrink: 0;
+}
+
 .seg-threshold-range {
     position: relative;
     height: 28px;

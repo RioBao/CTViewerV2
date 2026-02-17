@@ -153,11 +153,12 @@
                                 <input type="range" id="segBrushSize" min="1" max="64" step="1" value="8">
                             </div>
                             <div class="control-row" id="segThresholdRow" style="display: none;">
-                                <label for="segThresholdMin">Threshold Min</label>
-                                <input type="number" id="segThresholdMin" value="0">
-                                <label for="segThresholdMax">Threshold Max</label>
-                                <input type="number" id="segThresholdMax" value="0">
-                                <label for="segThresholdRangeMin">Threshold Range</label>
+                                <label>Threshold</label>
+                                <div class="seg-threshold-minmax">
+                                    <input type="number" id="segThresholdMin" placeholder="Min" value="0">
+                                    <span>–</span>
+                                    <input type="number" id="segThresholdMax" placeholder="Max" value="0">
+                                </div>
                                 <div class="seg-threshold-range" id="segThresholdRange">
                                     <div id="segThresholdRangeSelection" class="seg-threshold-range-selection"></div>
                                     <div id="segThresholdMarkerOtsu2" class="seg-threshold-range-marker otsu2" title="2-class split"></div>
@@ -165,6 +166,10 @@
                                     <div id="segThresholdMarkerOtsu3B" class="seg-threshold-range-marker otsu3" title="3-class split B"></div>
                                     <input type="range" id="segThresholdRangeMin" min="0" max="1" step="0.001" value="0">
                                     <input type="range" id="segThresholdRangeMax" min="0" max="1" step="0.001" value="1">
+                                </div>
+                                <div class="seg-ai-actions">
+                                    <button id="segThresholdApplyBtn" class="seg-action-btn" type="button">Apply</button>
+                                    <button id="segThresholdClearBtn" class="seg-action-btn" type="button">Clear Preview</button>
                                 </div>
                             </div>
                             <div class="control-row" id="segGrowRow" style="display: none;">

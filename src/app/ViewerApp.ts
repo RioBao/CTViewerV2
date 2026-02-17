@@ -276,6 +276,9 @@ export class ViewerApp {
     private maskSliceBuffers: Record<ViewAxis, MaskTypedArray | null> = { xy: null, xz: null, yz: null };
     private maskDisplaySliceBuffers: Record<ViewAxis, MaskTypedArray | null> = { xy: null, xz: null, yz: null };
     private maskPreviewSliceBuffers: Record<ViewAxis, MaskTypedArray | null> = { xy: null, xz: null, yz: null };
+    private thresholdPreviewIndices: Record<ViewAxis, Uint32Array | null> = { xy: null, xz: null, yz: null };
+    private thresholdPreviewBuffers: Record<ViewAxis, MaskTypedArray | null> = { xy: null, xz: null, yz: null };
+    private thresholdPreviewSliceIndices: Record<ViewAxis, number> = { xy: -1, xz: -1, yz: -1 };
     private smartRegionPromptLayers: Record<ViewAxis, HTMLDivElement | null> = { xy: null, xz: null, yz: null };
     private maskPaletteData = new Float32Array(256 * 4);
     private statsRefreshTimer: number | null = null;
@@ -423,6 +426,8 @@ export class ViewerApp {
     private segAIApplyPreviewBtn: HTMLButtonElement | null = null;
     private segAIClearPreviewBtn: HTMLButtonElement | null = null;
     private segAIClearCacheBtn: HTMLButtonElement | null = null;
+    private segThresholdApplyBtn: HTMLButtonElement | null = null;
+    private segThresholdClearBtn: HTMLButtonElement | null = null;
     private segRoiList: HTMLElement | null = null;
     private segToolPalette: HTMLElement | null = null;
     private segModeBtn: HTMLElement | null = null;
@@ -642,6 +647,7 @@ export class ViewerApp {
             this.maskSliceBuffers[axis] = maskSlice.data;
             maskSliceData = this.filterMaskSliceForDisplay(axis, maskSlice.data);
             maskSliceData = this.applySmartRegionPreviewToMaskSlice(axis, index, maskSliceData);
+            maskSliceData = this.applyThresholdPreviewToMaskSlice(axis, index, maskSliceData);
         }
 
         renderer.updateSlice(slice, maskSliceData);
@@ -2251,11 +2257,25 @@ export class ViewerApp {
             this.clearSmartRegionPreview({ render: true, resetStatus: true });
         }
 
+        const thresholdPreviewNeedsInvalidation =
+            prev.activeTool === 'threshold' || next.activeTool === 'threshold'
+                ? (prev.activeTool !== next.activeTool
+                    || prev.activeROIId !== next.activeROIId
+                    || patch.thresholdMin !== undefined
+                    || patch.thresholdMax !== undefined)
+                : false;
+        if (thresholdPreviewNeedsInvalidation) {
+            this.thresholdPreviewIndices = { xy: null, xz: null, yz: null };
+            this.thresholdPreviewBuffers = { xy: null, xz: null, yz: null };
+            this.scheduleSliceRender();
+        }
+
         this.uiState.update({ segmentation: next });
         if (patch.tool !== undefined || patch.paintValue !== undefined || patch.activeTool !== undefined) {
             this.updateSegmentationToolRows(next.activeTool);
             this.updateSegmentationToolButtons(next.activeTool);
             this.refreshSegmentationActionButtons();
+            this.refreshThresholdPreviewButtons();
         }
         if (patch.isPinned !== undefined) {
             this.updateSegmentationPanelVisibility();
@@ -2933,18 +2953,6 @@ export class ViewerApp {
         this.refreshSegmentationActionButtons();
     }
 
-    private shouldUseThresholdTool(modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean }): boolean {
-        const seg = this.uiState.state.segmentation;
-        const active = this.getActiveRoi();
-        const paintValue = this.getEffectiveBrushPaintValue(modifiers);
-        const canErase = paintValue === 0;
-        const canPaint = paintValue === 1 && !!active && !active.locked;
-        return !!this.maskVolume
-            && this.isSegmentationMode()
-            && seg.enabled
-            && seg.tool === 'threshold'
-            && (canErase || canPaint);
-    }
 
     private shouldUseRegionGrowTool(modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean }): boolean {
         const seg = this.uiState.state.segmentation;
@@ -3236,6 +3244,123 @@ export class ViewerApp {
         return out;
     }
 
+    private computeThresholdPreviewIndices(axis: ViewAxis, sliceIndex: number): Uint32Array {
+        const volume = this.volume;
+        const seg = this.uiState.state.segmentation;
+        if (!volume) return new Uint32Array(0);
+        const slice = volume.getSlice(axis, sliceIndex);
+        const values = slice.data;
+        const tMin = Math.min(seg.thresholdMin, seg.thresholdMax);
+        const tMax = Math.max(seg.thresholdMin, seg.thresholdMax);
+        const tmp = new Uint32Array(values.length);
+        let count = 0;
+        for (let i = 0; i < values.length; i++) {
+            const v = values[i];
+            if (v >= tMin && v <= tMax) tmp[count++] = i;
+        }
+        return count > 0 ? tmp.subarray(0, count) : new Uint32Array(0);
+    }
+
+    private applyThresholdPreviewToMaskSlice(
+        axis: ViewAxis,
+        sliceIndex: number,
+        maskSlice: MaskTypedArray | null,
+    ): MaskTypedArray | null {
+        const seg = this.uiState.state.segmentation;
+        if (seg.activeTool !== 'threshold' || !maskSlice) return maskSlice;
+        const active = this.getActiveRoi();
+        if (!active) return maskSlice;
+
+        // Lazily recompute when the slice position has changed or cache is empty.
+        if (this.thresholdPreviewSliceIndices[axis] !== sliceIndex || !this.thresholdPreviewIndices[axis]) {
+            this.thresholdPreviewSliceIndices[axis] = sliceIndex;
+            this.thresholdPreviewIndices[axis] = this.computeThresholdPreviewIndices(axis, sliceIndex);
+            this.thresholdPreviewBuffers[axis] = null;
+        }
+        const indices = this.thresholdPreviewIndices[axis]!;
+        if (indices.length === 0) return maskSlice;
+
+        const ctor = maskSlice instanceof Uint16Array ? Uint16Array : Uint8Array;
+        let out = this.thresholdPreviewBuffers[axis];
+        if (!out || out.length !== maskSlice.length || out.constructor !== ctor) {
+            out = new ctor(maskSlice.length) as MaskTypedArray;
+            this.thresholdPreviewBuffers[axis] = out;
+        }
+        out.set(maskSlice);
+        const classId = Math.max(1, Math.min(255, active.classId));
+        for (let i = 0; i < indices.length; i++) {
+            const idx = indices[i];
+            if (idx < out.length) out[idx] = classId;
+        }
+        return out;
+    }
+
+    private clearThresholdPreview(opts?: { render?: boolean }): void {
+        this.thresholdPreviewIndices = { xy: null, xz: null, yz: null };
+        this.thresholdPreviewBuffers = { xy: null, xz: null, yz: null };
+        this.thresholdPreviewSliceIndices = { xy: -1, xz: -1, yz: -1 };
+        this.refreshThresholdPreviewButtons();
+        if (opts?.render) this.renderSlices();
+    }
+
+    private refreshThresholdPreviewButtons(): void {
+        if (!this.segThresholdApplyBtn || !this.segThresholdClearBtn) return;
+        const seg = this.uiState.state.segmentation;
+        const isThreshold = seg.activeTool === 'threshold';
+        const active = this.getActiveRoi();
+        const eraseMode = seg.paintValue === 0;
+        const canApply = isThreshold && !this.segmentationWorkerBusy
+            && (eraseMode || !!(active && !active.locked));
+        this.segThresholdApplyBtn.disabled = !canApply;
+        const hasPreview = AXES.some(a => (this.thresholdPreviewIndices[a]?.length ?? 0) > 0);
+        this.segThresholdClearBtn.disabled = !hasPreview;
+    }
+
+    private async applyThresholdToMask(): Promise<void> {
+        if (this.segmentationWorkerBusy || !this.volume) return;
+        const active = this.getActiveRoi();
+        const seg = this.uiState.state.segmentation;
+        const eraseMode = seg.paintValue === 0;
+        if (!eraseMode && (!active || active.locked)) return;
+        const classId = eraseMode ? 0 : active!.classId;
+
+        this.segmentationWorkerBusy = true;
+        this.refreshThresholdPreviewButtons();
+        if (active && !eraseMode) this.setActiveRoiBusy(active.id, true);
+        try {
+            let changedTotal = 0;
+            for (const axis of AXES) {
+                const sliceIndex = this.uiState.state.slices[axis];
+                const targetSlices = this.getSliceIndicesWithRadius(axis, sliceIndex, seg.regionGrowSliceRadius);
+                for (const si of targetSlices) {
+                    const slice = this.volume!.getSlice(axis, si);
+                    const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
+                    const selected = await this.segmentationWorker.runThresholdSlice({
+                        width: slice.width,
+                        height: slice.height,
+                        values,
+                        min: Math.min(seg.thresholdMin, seg.thresholdMax),
+                        max: Math.max(seg.thresholdMin, seg.thresholdMax),
+                    });
+                    changedTotal += this.applySelectionIndicesToClass(axis, si, slice.width, slice.height, selected, classId);
+                }
+            }
+            if (changedTotal > 0) {
+                this.invalidateActiveRoiStats();
+                this.scheduleSliceRender();
+                this.scheduleActiveRoiStatsRefresh({ force: true });
+                this.updatePixelInfo();
+                this.schedule3DMaskSync({ immediate: true, render: true });
+            }
+        } catch (error) {
+            console.error('Threshold apply failed:', error);
+        } finally {
+            this.segmentationWorkerBusy = false;
+            if (active && !eraseMode) this.setActiveRoiBusy(active.id, false);
+            this.refreshThresholdPreviewButtons();
+        }
+    }
+
     private getSliceHitFromClient(axis: ViewAxis, clientX: number, clientY: number): SliceHit | null {
         const renderer = this.sliceRenderers[axis];
         const canvas = this.sliceCanvases[axis];
@@ -3355,57 +3480,6 @@ export class ViewerApp {
         return changed;
     }
 
-    private async runThresholdToolAtClient(
-        axis: ViewAxis,
-        clientX: number,
-        clientY: number,
-        modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean },
-    ): Promise<void> {
-        if (this.segmentationWorkerBusy || !this.volume) return;
-        const hit = this.getSliceHitFromClient(axis, clientX, clientY);
-        if (!hit) return;
-        const active = this.getActiveRoi();
-        const paintValue = this.getEffectiveBrushPaintValue(modifiers);
-        const eraseMode = paintValue === 0;
-        if (!eraseMode && (!active || active.locked)) return;
-        const classId = eraseMode ? 0 : active!.classId;
-        const seg = this.uiState.state.segmentation;
-        this.segmentationWorkerBusy = true;
-        if (active && !eraseMode) {
-            this.setActiveRoiBusy(active.id, true);
-        }
-        try {
-            const targetSlices = this.getSliceIndicesWithRadius(axis, hit.sliceIndex, seg.regionGrowSliceRadius);
-            let changedTotal = 0;
-            for (const sliceIndex of targetSlices) {
-                const slice = this.volume.getSlice(axis, sliceIndex);
-                const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
-                const selected = await this.segmentationWorker.runThresholdSlice({
-                    width: slice.width,
-                    height: slice.height,
-                    values,
-                    min: Math.min(seg.thresholdMin, seg.thresholdMax),
-                    max: Math.max(seg.thresholdMin, seg.thresholdMax),
-                });
-                changedTotal += this.applySelectionIndicesToClass(axis, sliceIndex, slice.width, slice.height, selected, classId);
-            }
-            if (changedTotal > 0) {
-                this.invalidateActiveRoiStats();
-                this.scheduleAxisRender(axis);
-                this.scheduleActiveRoiStatsRefresh({ force: true });
-                this.updatePixelInfo();
-                this.schedule3DMaskSync({ immediate: true, render: true });
-            }
-        } catch (error) {
-            console.error('Threshold tool failed:', error);
-        } finally {
-            this.segmentationWorkerBusy = false;
-            if (active && !eraseMode) {
-                this.setActiveRoiBusy(active.id, false);
-            }
-            this.refreshSmartRegionPreviewControls();
-        }
-    }
 
     private async runRegionGrowToolAtClient(
         axis: ViewAxis,
@@ -3785,10 +3859,6 @@ export class ViewerApp {
                     this.segmentationDragging = true;
                     this.segmentationDragAxis = axis;
                     this.paintBrushAtClient(axis, e.clientX, e.clientY, e);
-                    return;
-                }
-                if (this.shouldUseThresholdTool(e)) {
-                    void this.runThresholdToolAtClient(axis, e.clientX, e.clientY, e);
                     return;
                 }
                 if (this.shouldUseRegionGrowTool(e)) {
@@ -4781,6 +4851,19 @@ export class ViewerApp {
             segSliceRadius.addEventListener('input', updateSliceRadius);
             segSliceRadius.addEventListener('change', updateSliceRadius);
         }
+        this.segThresholdApplyBtn = document.getElementById('segThresholdApplyBtn') as HTMLButtonElement | null;
+        this.segThresholdClearBtn = document.getElementById('segThresholdClearBtn') as HTMLButtonElement | null;
+        if (this.segThresholdApplyBtn) {
+            this.segThresholdApplyBtn.addEventListener('click', () => {
+                void this.applyThresholdToMask();
+            });
+        }
+        if (this.segThresholdClearBtn) {
+            this.segThresholdClearBtn.addEventListener('click', () => {
+                this.clearThresholdPreview({ render: true });
+            });
+        }
+        this.refreshThresholdPreviewButtons();
     }
 
     // ================================================================
