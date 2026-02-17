@@ -427,7 +427,6 @@ export class ViewerApp {
     private segAIClearPreviewBtn: HTMLButtonElement | null = null;
     private segAIClearCacheBtn: HTMLButtonElement | null = null;
     private segThresholdApplyBtn: HTMLButtonElement | null = null;
-    private segThresholdClearBtn: HTMLButtonElement | null = null;
     private segRoiList: HTMLElement | null = null;
     private segToolPalette: HTMLElement | null = null;
     private segModeBtn: HTMLElement | null = null;
@@ -3295,16 +3294,8 @@ export class ViewerApp {
         return out;
     }
 
-    private clearThresholdPreview(opts?: { render?: boolean }): void {
-        this.thresholdPreviewIndices = { xy: null, xz: null, yz: null };
-        this.thresholdPreviewBuffers = { xy: null, xz: null, yz: null };
-        this.thresholdPreviewSliceIndices = { xy: -1, xz: -1, yz: -1 };
-        this.refreshThresholdPreviewButtons();
-        if (opts?.render) this.renderSlices();
-    }
-
     private refreshThresholdPreviewButtons(): void {
-        if (!this.segThresholdApplyBtn || !this.segThresholdClearBtn) return;
+        if (!this.segThresholdApplyBtn) return;
         const seg = this.uiState.state.segmentation;
         const isThreshold = seg.activeTool === 'threshold';
         const active = this.getActiveRoi();
@@ -3312,8 +3303,6 @@ export class ViewerApp {
         const canApply = isThreshold && !this.segmentationWorkerBusy
             && (eraseMode || !!(active && !active.locked));
         this.segThresholdApplyBtn.disabled = !canApply;
-        const hasPreview = AXES.some(a => (this.thresholdPreviewIndices[a]?.length ?? 0) > 0);
-        this.segThresholdClearBtn.disabled = !hasPreview;
     }
 
     private async applyThresholdToMask(): Promise<void> {
@@ -4852,15 +4841,9 @@ export class ViewerApp {
             segSliceRadius.addEventListener('change', updateSliceRadius);
         }
         this.segThresholdApplyBtn = document.getElementById('segThresholdApplyBtn') as HTMLButtonElement | null;
-        this.segThresholdClearBtn = document.getElementById('segThresholdClearBtn') as HTMLButtonElement | null;
         if (this.segThresholdApplyBtn) {
             this.segThresholdApplyBtn.addEventListener('click', () => {
                 void this.applyThresholdToMask();
-            });
-        }
-        if (this.segThresholdClearBtn) {
-            this.segThresholdClearBtn.addEventListener('click', () => {
-                this.clearThresholdPreview({ render: true });
             });
         }
         this.refreshThresholdPreviewButtons();
