@@ -23,7 +23,7 @@ import { Sam2SliceService, type Sam2InferenceQuality, type Sam2PromptPoint } fro
 const DEG = Math.PI / 180;
 const AXES: ViewAxis[] = ['xy', 'xz', 'yz'];
 type QualityPreset = 'low' | 'medium' | 'high';
-const MAX_SEGMENTATION_SLICE_RADIUS = 10;
+const MAX_SEGMENTATION_SLICE_RADIUS = 20;
 const ACTIVE_ROI_STATS_DEBOUNCE_MS = 220;
 const ACTIVE_ROI_STATS_CHUNK_TARGET_VOXELS = 1_200_000;
 const BRICK_SIZE = 8;
