@@ -419,7 +419,6 @@ export class ViewerApp {
     private segmentationGrip: HTMLElement | null = null;
     private segmentationPinBtn: HTMLElement | null = null;
     private segmentationAddRoiBtn: HTMLElement | null = null;
-    private segmentationSettingsBtn: HTMLElement | null = null;
     private segAIStatusEl: HTMLElement | null = null;
     private segAIBackendChipEl: HTMLElement | null = null;
     private segAIPreviewToggle: HTMLInputElement | null = null;
@@ -493,7 +492,6 @@ export class ViewerApp {
         this.segmentationGrip = document.getElementById('segmentationGrip');
         this.segmentationPinBtn = document.getElementById('segmentationPinBtn');
         this.segmentationAddRoiBtn = document.getElementById('segmentationAddRoiBtn');
-        this.segmentationSettingsBtn = document.getElementById('segmentationSettingsBtn');
         this.segAIStatusEl = document.getElementById('segAIStatus');
         this.segAIBackendChipEl = document.getElementById('segAIBackendChip');
         this.segAIPreviewToggle = document.getElementById('segAIPreviewToggle') as HTMLInputElement | null;
@@ -4929,15 +4927,6 @@ export class ViewerApp {
                 e.stopPropagation();
                 this.addRoiEntry(true);
                 this.scheduleSliceRender();
-            });
-        }
-        if (this.segmentationSettingsBtn) {
-            this.segmentationSettingsBtn.addEventListener('click', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                const advanced = document.getElementById('segAdvancedControls') as HTMLDetailsElement | null;
-                if (!advanced) return;
-                advanced.open = !advanced.open;
             });
         }
         if (this.sliceControls) {
