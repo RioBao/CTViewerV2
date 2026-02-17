@@ -51,8 +51,8 @@ export class StreamingVolumeData {
     /** Callback fired when an async slice is ready â€” ViewerApp should re-render */
     onSliceReady: ((axis: ViewAxis, index: number) => void) | null = null;
 
-    private file: File;
-    private lowRes: VolumeData;
+    private file: File | null;
+    private lowRes: VolumeData | null;
     private bpe: number; // bytes per element
     private sliceBytes: number; // bytes per XY slice in file
 
@@ -73,6 +73,7 @@ export class StreamingVolumeData {
     private currentYZSlice: SliceData | null = null;
     private currentYZIndex = -1;
     private yzLoadInProgress = false;
+    private disposed = false;
 
     constructor(file: File, metadata: VolumeMetadata, lowRes: VolumeData) {
         this.file = file;
@@ -89,11 +90,33 @@ export class StreamingVolumeData {
         this.sliceBytes = nx * ny * this.bpe;
     }
 
+    private getFileHandle(): File | null {
+        return this.file;
+    }
+
+    private getLowResVolume(): VolumeData | null {
+        return this.lowRes;
+    }
+
+    private makeEmptySlice(axis: ViewAxis): SliceData {
+        const [nx, ny, nz] = this.dimensions;
+        if (axis === 'xy') {
+            return { data: new Float32Array(nx * ny), width: nx, height: ny, isLowRes: true };
+        }
+        if (axis === 'xz') {
+            return { data: new Float32Array(nx * nz), width: nx, height: nz, isLowRes: true };
+        }
+        return { data: new Float32Array(ny * nz), width: ny, height: nz, isLowRes: true };
+    }
+
     /**
      * Synchronous slice access â€” returns cached full-res or upscaled low-res fallback.
      * Always returns immediately.
      */
     getSlice(axis: ViewAxis, index: number): SliceData {
+        if (this.disposed) {
+            return this.makeEmptySlice(axis);
+        }
         if (axis === 'xy') {
             // Check XY LRU cache
             const cached = this.xyCache.get(index);
@@ -123,6 +146,9 @@ export class StreamingVolumeData {
      * For XZ/YZ: independent slab-based progressive loading with cancellation.
      */
     getSliceAsync(axis: ViewAxis, index: number): Promise<SliceData> {
+        if (this.disposed) {
+            return Promise.resolve(this.makeEmptySlice(axis));
+        }
         if (axis === 'xy') {
             const cached = this.xyCache.get(index);
             if (cached) {
@@ -149,7 +175,11 @@ export class StreamingVolumeData {
 
     /** Returns the 4x-downsampled volume for MIP rendering */
     getMIPVolume(): VolumeData {
-        return this.lowRes;
+        const lowRes = this.lowRes;
+        if (!lowRes) {
+            throw new Error('Streaming volume has been disposed.');
+        }
+        return lowRes;
     }
 
     /** Trigger prefetch of nearby XY slices */
@@ -187,13 +217,14 @@ export class StreamingVolumeData {
     getValue(x: number, y: number, z: number): number | null {
         const [nx, ny, nz] = this.dimensions;
         if (x < 0 || x >= nx || y < 0 || y >= ny || z < 0 || z >= nz) return null;
-
-        const [lx, ly, lz] = this.lowRes.dimensions;
-        const scale = this.lowRes.dimensions[0] > 0 ? nx / lx : 4;
+        const lowRes = this.getLowResVolume();
+        if (!lowRes) return null;
+        const [lx, ly, lz] = lowRes.dimensions;
+        const scale = lowRes.dimensions[0] > 0 ? nx / lx : 4;
         const lxi = Math.min(lx - 1, Math.floor(x / scale));
         const lyi = Math.min(ly - 1, Math.floor(y / scale));
         const lzi = Math.min(lz - 1, Math.floor(z / scale));
-        return this.lowRes.getValue(lxi, lyi, lzi);
+        return lowRes.getValue(lxi, lyi, lzi);
     }
 
     /** Volume info summary */
@@ -233,6 +264,7 @@ export class StreamingVolumeData {
 
     /** Cleanup file reference and caches */
     dispose(): void {
+        this.disposed = true;
         this.xyCache.clear();
         this.prefetchInProgress.clear();
         this.currentXZSlice = null;
@@ -242,8 +274,8 @@ export class StreamingVolumeData {
         this.onSliceReady = null;
         // Release large retained objects so GC can reclaim them even if
         // pending promise chains still reference `this`.
-        (this as unknown as { file: File | null }).file = null;
-        (this as unknown as { lowRes: VolumeData | null }).lowRes = null;
+        this.file = null;
+        this.lowRes = null;
     }
 
     // ========================================================================
@@ -252,6 +284,9 @@ export class StreamingVolumeData {
 
     /** Read a single XY slice â€” contiguous in file, fast (~4MB, <50ms) */
     private readXYSlice(index: number): Promise<SliceData> {
+        if (this.disposed) {
+            return Promise.resolve(this.makeEmptySlice('xy'));
+        }
         // Already cached?
         const cached = this.xyCache.get(index);
         if (cached) {
@@ -266,6 +301,10 @@ export class StreamingVolumeData {
         // Enqueue serialized read (prevents I/O thrashing)
         const readPromise = new Promise<SliceData>((resolve) => {
             this.xyQueue = this.xyQueue.then(async () => {
+                if (this.disposed) {
+                    resolve(this.makeEmptySlice('xy'));
+                    return;
+                }
                 // Re-check cache (may have been loaded by a concurrent path)
                 const c = this.xyCache.get(index);
                 if (c) {
@@ -273,7 +312,16 @@ export class StreamingVolumeData {
                     return;
                 }
 
-                const buf = await this.file.slice(offset, offset + this.sliceBytes).arrayBuffer();
+                const file = this.getFileHandle();
+                if (!file) {
+                    resolve(this.makeEmptySlice('xy'));
+                    return;
+                }
+                const buf = await file.slice(offset, offset + this.sliceBytes).arrayBuffer();
+                if (this.disposed) {
+                    resolve(this.makeEmptySlice('xy'));
+                    return;
+                }
                 const data = bufferToTypedArray(buf, this.dataType, nx * ny);
                 const slice: SliceData = { data, width: nx, height: ny };
 
@@ -298,6 +346,7 @@ export class StreamingVolumeData {
      * Cancels if the requested index changes mid-load.
      */
     private async loadXZSliceAsync(y: number): Promise<void> {
+        if (this.disposed) return;
         // If already loading this exact index, don't restart
         if (this.xzLoadInProgress && this.currentXZIndex === y) return;
 
@@ -309,10 +358,13 @@ export class StreamingVolumeData {
         this.currentXZSlice = null;
 
         try {
+            const lowRes = this.getLowResVolume();
+            if (!lowRes) return;
+
             // Initialize with upscaled low-res data
             const sliceData = new Float32Array(nx * nz);
-            const [lnx, lny, lnz] = this.lowRes.dimensions;
-            const lowData = this.lowRes.data;
+            const [lnx, lny, lnz] = lowRes.dimensions;
+            const lowData = lowRes.data;
             const scale = Math.round(nx / lnx);
             const ly = Math.min(Math.floor(y / scale), lny - 1);
             for (let z = 0; z < nz; z++) {
@@ -338,15 +390,19 @@ export class StreamingVolumeData {
             for (const slabIdx of slabOrder) {
                 // Cancellation check: user scrolled away
                 if (this.currentXZIndex !== y) return;
+                if (this.disposed) return;
 
                 const zStart = slabIdx * slabSlices;
                 const zEnd = Math.min(zStart + slabSlices, nz);
 
                 // One large contiguous read for the slab
-                const slabBuffer = await this.file.slice(
+                const file = this.getFileHandle();
+                if (!file) return;
+                const slabBuffer = await file.slice(
                     zStart * this.sliceBytes,
                     zEnd * this.sliceBytes,
                 ).arrayBuffer();
+                if (this.disposed) return;
 
                 // Extract row y from each z-level using typed array views (zero-copy)
                 for (let z = zStart; z < zEnd; z++) {
@@ -376,7 +432,9 @@ export class StreamingVolumeData {
                 this.onSliceReady?.('xz', y);
             }
         } catch (e) {
-            console.warn(`Failed to load XZ slice at y=${y}:`, e);
+            if (!this.disposed) {
+                console.warn(`Failed to load XZ slice at y=${y}:`, e);
+            }
         } finally {
             this.xzLoadInProgress = false;
         }
@@ -393,6 +451,7 @@ export class StreamingVolumeData {
      * Center-out order, cancellation, progressive callbacks.
      */
     private async loadYZSliceAsync(x: number): Promise<void> {
+        if (this.disposed) return;
         if (this.yzLoadInProgress && this.currentYZIndex === x) return;
 
         const [nx, ny, nz] = this.dimensions;
@@ -403,10 +462,13 @@ export class StreamingVolumeData {
         this.currentYZSlice = null;
 
         try {
+            const lowRes = this.getLowResVolume();
+            if (!lowRes) return;
+
             // Initialize with upscaled low-res data
             const sliceData = new Float32Array(ny * nz);
-            const [lnx, lny, lnz] = this.lowRes.dimensions;
-            const lowData = this.lowRes.data;
+            const [lnx, lny, lnz] = lowRes.dimensions;
+            const lowData = lowRes.data;
             const scale = Math.round(nx / lnx);
             const lx = Math.min(Math.floor(x / scale), lnx - 1);
             for (let z = 0; z < nz; z++) {
@@ -432,14 +494,18 @@ export class StreamingVolumeData {
             for (const slabIdx of slabOrder) {
                 // Cancellation check
                 if (this.currentYZIndex !== x) return;
+                if (this.disposed) return;
 
                 const zStart = slabIdx * slabSlices;
                 const zEnd = Math.min(zStart + slabSlices, nz);
 
-                const slabBuffer = await this.file.slice(
+                const file = this.getFileHandle();
+                if (!file) return;
+                const slabBuffer = await file.slice(
                     zStart * this.sliceBytes,
                     zEnd * this.sliceBytes,
                 ).arrayBuffer();
+                if (this.disposed) return;
 
                 // Extract column x from each z-level
                 for (let z = zStart; z < zEnd; z++) {
@@ -471,7 +537,9 @@ export class StreamingVolumeData {
                 this.onSliceReady?.('yz', x);
             }
         } catch (e) {
-            console.warn(`Failed to load YZ slice at x=${x}:`, e);
+            if (!this.disposed) {
+                console.warn(`Failed to load YZ slice at x=${x}:`, e);
+            }
         } finally {
             this.yzLoadInProgress = false;
         }
@@ -483,9 +551,13 @@ export class StreamingVolumeData {
 
     /** Get an upscaled low-res slice as fallback */
     private getLowResSlice(axis: ViewAxis, index: number): SliceData {
+        const lowRes = this.getLowResVolume();
+        if (!lowRes) {
+            return this.makeEmptySlice(axis);
+        }
         const [nx, ny, nz] = this.dimensions;
-        const [lnx, lny, lnz] = this.lowRes.dimensions;
-        const lowData = this.lowRes.data;
+        const [lnx, lny, lnz] = lowRes.dimensions;
+        const lowData = lowRes.data;
         const scale = Math.round(nx / lnx);
 
         if (axis === 'xy') {
@@ -555,6 +627,9 @@ export class StreamingVolumeData {
      * @param scale Downsample factor (2 = half resolution, 4 = quarter)
      */
     async createDownsampledVolume(scale: number, onProgress?: (progress: number) => void): Promise<VolumeData | null> {
+        if (this.disposed) return null;
+        const file = this.getFileHandle();
+        if (!file) return null;
         const [nx, ny, nz] = this.dimensions;
         const dstNx = Math.ceil(nx / scale);
         const dstNy = Math.ceil(ny / scale);
@@ -603,10 +678,12 @@ export class StreamingVolumeData {
             const accum = new Float64Array(dstNx * dstNy);
 
             for (let sz = 0; sz < zN; sz++) {
+                if (this.disposed) return null;
                 const z = sz === 0 ? zFirst : zLast;
                 const offset = z * this.sliceBytes;
-                const blob = this.file.slice(offset, offset + this.sliceBytes);
+                const blob = file.slice(offset, offset + this.sliceBytes);
                 const buffer = await blob.arrayBuffer();
+                if (this.disposed) return null;
                 const srcSlice = bufferToTypedArray(buffer, this.dataType, nx * ny);
 
                 for (let dy = 0; dy < dstNy; dy++) {
@@ -660,4 +737,3 @@ export class StreamingVolumeData {
         );
     }
 }
-

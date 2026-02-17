@@ -31,6 +31,7 @@ const MAX_SAFE_3D_UPLOAD_BYTES = 384 * 1024 * 1024; // 384 MB conservative budge
 const MASK_3D_SYNC_IDLE_MS = 48;
 const MASK_3D_SYNC_DRAG_MS = 140;
 const REGION_GROW_GPU_DISABLE_AFTER_MS = 900;
+const ENABLE_REGION_GROW_WEBGPU = false;
 const SMART_REGION_STATUS_DEFAULT = 'Click in a slice to run SAM2 on the current slice.';
 
 interface ActiveRoiStatsAccumulator {
@@ -398,8 +399,14 @@ export class ViewerApp {
             }
             this.mipRenderer = new MIPRenderer(this.gpu, this.canvas3D);
             try {
-                this.segmentationGpuCompute = new SegmentationGpuCompute(this.gpu);
-                this.segmentationGpuComputeFailed = false;
+                if (ENABLE_REGION_GROW_WEBGPU) {
+                    this.segmentationGpuCompute = new SegmentationGpuCompute(this.gpu);
+                    this.segmentationGpuComputeFailed = false;
+                } else {
+                    this.segmentationGpuCompute = null;
+                    this.segmentationGpuComputeFailed = true;
+                    console.info('Region grow WebGPU backend disabled by default; using worker backend.');
+                }
             } catch (error) {
                 this.segmentationGpuCompute = null;
                 this.segmentationGpuComputeFailed = true;

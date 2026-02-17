@@ -162,7 +162,6 @@ export class Sam2SliceService {
     private encoderSession: ort.InferenceSession | null = null;
     private decoderSession: ort.InferenceSession | null = null;
     private encoderInputName = 'input_image';
-    private preferWebGpu = true;
     private initPromise: Promise<void> | null = null;
     private embeddingCache = new Map<string, Sam2EmbeddingCacheEntry>();
 
@@ -175,10 +174,14 @@ export class Sam2SliceService {
     }
 
     isUsingWasmFallback(): boolean {
-        return !this.preferWebGpu;
+        return false;
     }
 
     async segmentFromClick(request: Sam2SliceRequest): Promise<Sam2SliceResult> {
+        return this.segmentFromClickInternal(request, true);
+    }
+
+    private async segmentFromClickInternal(request: Sam2SliceRequest, allowWebGpuRecoveryRetry: boolean): Promise<Sam2SliceResult> {
         try {
             const startedAt = performance.now();
             await this.ensureInitialized();
@@ -230,7 +233,7 @@ export class Sam2SliceService {
                 const decoderOutputs = await this.decoderSession!.run(inputs);
                 const masks = getRequiredTensor(decoderOutputs, 'masks');
                 const iouPredictions = getRequiredTensor(decoderOutputs, 'iou_predictions');
-                const decoded = this.decodeMasksToIndices(masks, iouPredictions, width, height);
+                const decoded = await this.decodeMasksToIndices(masks, iouPredictions, width, height);
                 selectedIndices = new Uint32Array(decoded.selectedIndices);
                 iouScore = decoded.iouScore;
                 disposeTensor(masks);
@@ -253,9 +256,13 @@ export class Sam2SliceService {
                 },
             };
         } catch (error) {
-            if (this.shouldFallbackToWasm(error)) {
-                await this.switchToWasmFallback(error);
-                return this.segmentFromClick(request);
+            if (allowWebGpuRecoveryRetry && this.shouldRecoverWebGpu(error)) {
+                await this.recoverWebGpuSessions(error);
+                return this.segmentFromClickInternal(request, false);
+            }
+            if (this.shouldRecoverWebGpu(error)) {
+                const message = error instanceof Error ? error.message : String(error);
+                throw new Error(`SAM2 WebGPU failed after a recovery retry. ${message}`);
             }
             throw error;
         }
@@ -286,8 +293,9 @@ export class Sam2SliceService {
 
     private async initSessions(): Promise<void> {
         const sessionOptions: ort.InferenceSession.SessionOptions = {
-            executionProviders: this.preferWebGpu ? ['webgpu', 'wasm'] : ['wasm'],
+            executionProviders: ['webgpu'],
             graphOptimizationLevel: 'disabled',
+            enableGraphCapture: false,
         };
 
         try {
@@ -345,9 +353,9 @@ export class Sam2SliceService {
         const imageTensor = new ort.Tensor('float32', inputData, [1, 3, SAM2_INPUT_SIZE, SAM2_INPUT_SIZE]);
         try {
             const outputs = await this.encoderSession!.run({ [this.encoderInputName]: imageTensor });
-            const imageEmbed = getRequiredTensor(outputs, 'image_embed');
-            const highResFeat0 = getRequiredTensor(outputs, 'high_res_feats_0');
-            const highResFeat1 = getRequiredTensor(outputs, 'high_res_feats_1');
+            const imageEmbed = await this.toCpuFloat32Tensor(getRequiredTensor(outputs, 'image_embed'));
+            const highResFeat0 = await this.toCpuFloat32Tensor(getRequiredTensor(outputs, 'high_res_feats_0'));
+            const highResFeat1 = await this.toCpuFloat32Tensor(getRequiredTensor(outputs, 'high_res_feats_1'));
             return {
                 key: cacheKey,
                 imageEmbed,
@@ -424,17 +432,14 @@ export class Sam2SliceService {
         };
     }
 
-    private decodeMasksToIndices(
+    private async decodeMasksToIndices(
         masks: ort.Tensor,
         iouPredictions: ort.Tensor,
         width: number,
         height: number,
-    ): { selectedIndices: Uint32Array; iouScore: number } {
-        const masksData = masks.data as Float32Array;
-        const iouData = iouPredictions.data as Float32Array;
-        if (!(masksData instanceof Float32Array) || !(iouData instanceof Float32Array)) {
-            throw new Error('SAM2 decoder returned unsupported tensor types');
-        }
+    ): Promise<{ selectedIndices: Uint32Array; iouScore: number }> {
+        const masksData = await this.readFloat32TensorData(masks);
+        const iouData = await this.readFloat32TensorData(iouPredictions);
 
         const maskCount = masks.dims[1] ?? 1;
         const area = SAM2_MASK_SIZE * SAM2_MASK_SIZE;
@@ -488,6 +493,31 @@ export class Sam2SliceService {
         disposeTensor(entry.highResFeat1);
     }
 
+    private async toCpuFloat32Tensor(tensor: ort.Tensor): Promise<ort.Tensor> {
+        const data = await this.readFloat32TensorData(tensor);
+        const dims = [...tensor.dims];
+        const cpuTensor = new ort.Tensor('float32', new Float32Array(data), dims);
+        disposeTensor(tensor);
+        return cpuTensor;
+    }
+
+    private async readFloat32TensorData(tensor: ort.Tensor): Promise<Float32Array> {
+        const maybe = tensor as unknown as {
+            data?: unknown;
+            getData?: (releaseData?: boolean) => Promise<unknown>;
+        };
+        if (maybe.data instanceof Float32Array) {
+            return maybe.data;
+        }
+        if (typeof maybe.getData === 'function') {
+            const downloaded = await maybe.getData(false);
+            if (downloaded instanceof Float32Array) {
+                return downloaded;
+            }
+        }
+        throw new Error('SAM2 decoder returned unsupported tensor types');
+    }
+
     private resolveEncoderInputName(): string {
         const session = this.encoderSession as unknown as { inputNames?: string[] } | null;
         const inputNames = session?.inputNames ?? [];
@@ -496,16 +526,14 @@ export class Sam2SliceService {
         return inputNames[0] ?? 'input_image';
     }
 
-    private shouldFallbackToWasm(error: unknown): boolean {
-        if (!this.preferWebGpu) return false;
+    private shouldRecoverWebGpu(error: unknown): boolean {
         const message = error instanceof Error ? error.message : String(error);
-        return /webgpu validation failed|used in submit while destroyed|device lost|failed to call ortrun\(\)/i.test(message);
+        return /webgpu validation failed|used in submit while destroyed|device lost|failed to call ortrun\(\)|failed to execute 'mapasync' on 'gpubuffer'|dxgi_error_device_hung/i.test(message);
     }
 
-    private async switchToWasmFallback(error: unknown): Promise<void> {
+    private async recoverWebGpuSessions(error: unknown): Promise<void> {
         const message = error instanceof Error ? error.message : String(error);
-        console.warn(`[SmartRegion] ORT WebGPU failed, switching SAM2 to WASM fallback. ${message}`);
-        this.preferWebGpu = false;
+        console.warn(`[SmartRegion] ORT WebGPU failed, recreating SAM2 sessions and retrying once. ${message}`);
         this.clearEmbeddingCache();
         this.encoderSession = null;
         this.decoderSession = null;
