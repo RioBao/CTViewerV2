@@ -200,3 +200,11 @@ Flat/minimal UI: Simple shapes, minimal gradients, clean icons.
     "large": "24px"
   }
 }
+
+Crash Log Notes (Codex)
+- Persistent crash log entries are stored in browser localStorage key: `viewerV2.crashlog.entries`
+- Current/previous session state is stored in key: `viewerV2.crashlog.session`
+- After reopening the app post-crash, run in DevTools console:
+  - `window.viewerCrashLog.getEntries()`
+- To clear old logs:
+  - `window.viewerCrashLog.clear()`

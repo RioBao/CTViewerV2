@@ -92,12 +92,16 @@ export class SegmentationWorkerClient {
     }
 
     private toTransferArrayBuffer(view: ArrayBufferView): ArrayBuffer {
-        if (view.buffer instanceof ArrayBuffer && view.byteOffset === 0 && view.byteLength === view.buffer.byteLength) {
-            return view.buffer;
+        // Always copy before transfer so caller-owned/cached arrays never get detached.
+        try {
+            const out = new Uint8Array(view.byteLength);
+            out.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+            return out.buffer;
+        } catch (error) {
+            throw new Error(
+                `Failed to prepare worker buffer transfer (source may be detached): ${error instanceof Error ? error.message : String(error)}`,
+            );
         }
-        const out = new Uint8Array(view.byteLength);
-        out.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
-        return out.buffer;
     }
 
     private enqueueTask<T>(

@@ -16,6 +16,9 @@ export interface MaskVolume {
     readonly backend: MaskBackend;
     getVoxel(x: number, y: number, z: number): number;
     setVoxel(x: number, y: number, z: number, classId: number): boolean;
+    getNonZeroVoxelCount(): number;
+    getClassVoxelCount(classId: number): number;
+    forEachVoxelOfClass(classId: number, visitor: (x: number, y: number, z: number) => void): number;
     clear(): void;
     fill(classId: number): void;
     getSlice(axis: ViewAxis, index: number, target?: MaskTypedArray): MaskSliceData;

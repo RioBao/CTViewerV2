@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "onnxruntime-web": "^1.24.1",
     "utif2": "^4.1.0"
   },
   "devDependencies": {

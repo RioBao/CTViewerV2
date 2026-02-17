@@ -1,5 +1,8 @@
 import './styles/main.css';
+import { disposeCrashLogger, initCrashLogger } from './app/CrashLogger.js';
 import { ViewerApp } from './app/ViewerApp.js';
+
+initCrashLogger();
 
 const app = new ViewerApp();
 app.initialize().catch((err) => {
@@ -13,6 +16,7 @@ app.initialize().catch((err) => {
 // Vite HMR: dispose old instance so event listeners don't leak
 if (import.meta.hot) {
     import.meta.hot.dispose(() => {
+        disposeCrashLogger();
         app.dispose();
     });
 }

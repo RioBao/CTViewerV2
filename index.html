@@ -165,7 +165,23 @@
                                 <input type="number" id="segSliceRadius" min="0" max="10" step="1" value="1">
                             </div>
                             <div class="control-row" id="segAIRow" style="display: none;">
-                                <span>AI Smart Region preview controls will appear here.</span>
+                                <div class="seg-ai-panel">
+                                    <div class="seg-ai-header">
+                                        <div class="seg-ai-title">SAM2</div>
+                                        <span id="segAIBackendChip" class="seg-ai-chip" style="display: none;">CPU only</span>
+                                    </div>
+                                    <div id="segAIStatus" class="seg-ai-status">Click in a slice to run SAM2 on the current slice.</div>
+                                    <label class="seg-ai-toggle">
+                                        <input id="segAIPreviewToggle" type="checkbox" checked>
+                                        Preview before apply
+                                    </label>
+                                    <div class="seg-ai-actions">
+                                        <button id="segAIApplyPreviewBtn" class="seg-action-btn" type="button" disabled>Apply Preview</button>
+                                        <button id="segAIClearPreviewBtn" class="seg-action-btn" type="button" disabled>Clear Preview</button>
+                                        <button id="segAIClearCacheBtn" class="seg-action-btn" type="button">Clear AI Cache</button>
+                                    </div>
+                                    <div class="seg-ai-hint">Tip: Shift+Click sends a negative point.</div>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -202,7 +218,6 @@
                         </div>
                         <div class="viewport-container viewport-3d" data-axis="3d">
                             <span class="viewport-label">3D</span>
-                            <span class="resolution-indicator" id="resolution3D"></span>
                             <canvas id="canvas3D" class="viewport-canvas"></canvas>
 
                             <div class="viewport-3d-controls" id="viewport3DControls">

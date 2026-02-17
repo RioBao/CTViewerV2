@@ -30,6 +30,9 @@ abstract class BaseMaskVolume implements MaskVolume {
     readonly classDataType: MaskClassDataType;
     readonly maxClassId: number;
     readonly backend: MaskBackend;
+    protected readonly totalVoxels: number;
+    protected classCounts: Uint32Array;
+    protected nonZeroVoxels = 0;
     protected _disposed = false;
     protected dirtyAll = true;
     protected dirtyXY = new Set<number>();
@@ -44,6 +47,9 @@ abstract class BaseMaskVolume implements MaskVolume {
         this.dimensions = dimensions;
         this.classDataType = classDataType;
         this.maxClassId = classDataType === 'uint16' ? 65535 : 255;
+        this.totalVoxels = dimensions[0] * dimensions[1] * dimensions[2];
+        this.classCounts = new Uint32Array(this.maxClassId + 1);
+        this.classCounts[0] = this.totalVoxels;
         this.backend = backend;
     }
 
@@ -53,10 +59,23 @@ abstract class BaseMaskVolume implements MaskVolume {
 
     abstract getVoxel(x: number, y: number, z: number): number;
     abstract setVoxel(x: number, y: number, z: number, classId: number): boolean;
+    abstract forEachVoxelOfClass(classId: number, visitor: (x: number, y: number, z: number) => void): number;
     abstract clear(): void;
     abstract fill(classId: number): void;
     abstract getSlice(axis: ViewAxis, index: number, target?: MaskTypedArray): MaskSliceData;
     abstract dispose(): void;
+
+    getNonZeroVoxelCount(): number {
+        this.checkDisposed();
+        return this.nonZeroVoxels;
+    }
+
+    getClassVoxelCount(classId: number): number {
+        this.checkDisposed();
+        const normalized = this.normalizeClassIdOrNull(classId);
+        if (normalized == null) return 0;
+        return this.classCounts[normalized];
+    }
 
     consumeSliceDirty(axis: ViewAxis, index: number): boolean {
         if (this.dirtyAll) return true;
@@ -84,6 +103,30 @@ abstract class BaseMaskVolume implements MaskVolume {
     protected finalizeBulkEdit(): void {
         this.markAllDirty();
     }
+
+    protected normalizeClassIdOrNull(classId: number): number | null {
+        if (!Number.isFinite(classId)) return null;
+        const rounded = Math.round(classId);
+        if (rounded < 0 || rounded > this.maxClassId) return null;
+        return rounded;
+    }
+
+    protected resetClassCounts(fillClass: number): void {
+        this.classCounts.fill(0);
+        this.classCounts[fillClass] = this.totalVoxels;
+        this.nonZeroVoxels = fillClass === 0 ? 0 : this.totalVoxels;
+    }
+
+    protected noteVoxelClassChange(previousClass: number, nextClass: number): void {
+        if (previousClass === nextClass) return;
+        this.classCounts[previousClass]--;
+        this.classCounts[nextClass]++;
+        if (previousClass === 0 && nextClass !== 0) {
+            this.nonZeroVoxels++;
+        } else if (previousClass !== 0 && nextClass === 0) {
+            this.nonZeroVoxels--;
+        }
+    }
 }
 
 class DenseMaskVolume extends BaseMaskVolume {
@@ -108,21 +151,48 @@ class DenseMaskVolume extends BaseMaskVolume {
         if (x < 0 || y < 0 || z < 0 || x >= nx || y >= ny || z >= nz) return false;
         const idx = x + y * nx + z * nx * ny;
         const next = clampClassId(classId, this.maxClassId);
-        if (this.data[idx] === next) return false;
+        const previous = this.data[idx];
+        if (previous === next) return false;
         this.data[idx] = next;
+        this.noteVoxelClassChange(previous, next);
         this.markVoxelDirty(x, y, z);
         return true;
+    }
+
+    forEachVoxelOfClass(classId: number, visitor: (x: number, y: number, z: number) => void): number {
+        this.checkDisposed();
+        const target = this.normalizeClassIdOrNull(classId);
+        if (target == null) return 0;
+        const expected = this.classCounts[target];
+        if (expected === 0) return 0;
+
+        const [nx, ny, nz] = this.dimensions;
+        let matched = 0;
+        let linear = 0;
+        for (let z = 0; z < nz; z++) {
+            for (let y = 0; y < ny; y++) {
+                for (let x = 0; x < nx; x++, linear++) {
+                    if (this.data[linear] !== target) continue;
+                    visitor(x, y, z);
+                    matched++;
+                }
+            }
+        }
+        return matched;
     }
 
     clear(): void {
         this.checkDisposed();
         this.data.fill(0);
+        this.resetClassCounts(0);
         this.finalizeBulkEdit();
     }
 
     fill(classId: number): void {
         this.checkDisposed();
-        this.data.fill(clampClassId(classId, this.maxClassId));
+        const fillClass = clampClassId(classId, this.maxClassId);
+        this.data.fill(fillClass);
+        this.resetClassCounts(fillClass);
         this.finalizeBulkEdit();
     }
 
@@ -197,7 +267,7 @@ function unpackChunkKey(key: string): ChunkKey {
 class SparseChunkMaskVolume extends BaseMaskVolume {
     private readonly chunkSize: number;
     private readonly chunks = new Map<string, MaskTypedArray>();
-    /** Lazy fill value — when non-zero, voxels without a chunk return this instead of 0. */
+    /** Lazy fill value - when non-zero, voxels without a chunk return this instead of 0. */
     private fillValue = 0;
 
     constructor(dimensions: [number, number, number], classDataType: MaskClassDataType, chunkSize: number) {
@@ -235,30 +305,81 @@ class SparseChunkMaskVolume extends BaseMaskVolume {
         const cy = Math.floor(y / cs);
         const cz = Math.floor(z / cs);
         const key = packChunkKey(cx, cy, cz);
-
-        let chunk = this.chunks.get(key);
-        if (!chunk) {
-            if (next === this.fillValue) return false;
-            chunk = createMaskArray(cs * cs * cs, this.classDataType);
-            if (this.fillValue !== 0) chunk.fill(this.fillValue);
-            this.chunks.set(key, chunk);
-        }
-
         const lx = x - cx * cs;
         const ly = y - cy * cs;
         const lz = z - cz * cs;
         const idx = lx + ly * cs + lz * cs * cs;
-        if (chunk[idx] === next) return false;
+
+        let chunk = this.chunks.get(key);
+        const previous = chunk ? chunk[idx] : this.fillValue;
+        if (previous === next) return false;
+        if (!chunk) {
+            chunk = createMaskArray(cs * cs * cs, this.classDataType);
+            if (this.fillValue !== 0) chunk.fill(this.fillValue);
+            this.chunks.set(key, chunk);
+        }
         chunk[idx] = next;
+        this.noteVoxelClassChange(previous, next);
 
         this.markVoxelDirty(x, y, z);
         return true;
+    }
+
+    forEachVoxelOfClass(classId: number, visitor: (x: number, y: number, z: number) => void): number {
+        this.checkDisposed();
+        const target = this.normalizeClassIdOrNull(classId);
+        if (target == null) return 0;
+        const expected = this.classCounts[target];
+        if (expected === 0) return 0;
+
+        const [nx, ny, nz] = this.dimensions;
+        const cs = this.chunkSize;
+        let matched = 0;
+
+        if (this.fillValue === target) {
+            for (let z = 0; z < nz; z++) {
+                for (let y = 0; y < ny; y++) {
+                    for (let x = 0; x < nx; x++) {
+                        if (this.getVoxel(x, y, z) !== target) continue;
+                        visitor(x, y, z);
+                        matched++;
+                    }
+                }
+            }
+            return matched;
+        }
+
+        for (const [key, chunk] of this.chunks) {
+            const { cx, cy, cz } = unpackChunkKey(key);
+            const x0 = cx * cs;
+            const y0 = cy * cs;
+            const z0 = cz * cs;
+            const xMax = Math.min(x0 + cs, nx);
+            const yMax = Math.min(y0 + cs, ny);
+            const zMax = Math.min(z0 + cs, nz);
+
+            for (let z = z0; z < zMax; z++) {
+                const lz = z - z0;
+                for (let y = y0; y < yMax; y++) {
+                    const ly = y - y0;
+                    const rowBase = lz * cs * cs + ly * cs;
+                    for (let x = x0; x < xMax; x++) {
+                        if (chunk[rowBase + (x - x0)] !== target) continue;
+                        visitor(x, y, z);
+                        matched++;
+                    }
+                }
+            }
+        }
+
+        return matched;
     }
 
     clear(): void {
         this.checkDisposed();
         this.chunks.clear();
         this.fillValue = 0;
+        this.resetClassCounts(0);
         this.finalizeBulkEdit();
     }
 
@@ -267,6 +388,7 @@ class SparseChunkMaskVolume extends BaseMaskVolume {
         const fillClass = clampClassId(classId, this.maxClassId);
         this.chunks.clear();
         this.fillValue = fillClass;
+        this.resetClassCounts(fillClass);
         this.finalizeBulkEdit();
     }
 

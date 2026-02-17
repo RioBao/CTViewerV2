@@ -117,18 +117,13 @@ export class SegmentationStore {
 
     forEachVoxelOfClass(classId: number, visitor: (x: number, y: number, z: number, linearIndex: number) => void): number {
         if (!this._maskVolume) return 0;
-        const [nx, ny, nz] = this._maskVolume.dimensions;
+        const [nx, ny] = this._maskVolume.dimensions;
         let matched = 0;
-        let linear = 0;
-        for (let z = 0; z < nz; z++) {
-            for (let y = 0; y < ny; y++) {
-                for (let x = 0; x < nx; x++, linear++) {
-                    if (this._maskVolume.getVoxel(x, y, z) !== classId) continue;
-                    matched++;
-                    visitor(x, y, z, linear);
-                }
-            }
-        }
+        this._maskVolume.forEachVoxelOfClass(classId, (x, y, z) => {
+            const linear = x + y * nx + z * nx * ny;
+            matched++;
+            visitor(x, y, z, linear);
+        });
         return matched;
     }
 
@@ -183,14 +178,9 @@ export class SegmentationStore {
         if (!this._maskVolume) return null;
         const [nx, ny, nz] = this._maskVolume.dimensions;
         const bits = new Uint8Array(nx * ny * nz);
-        let linear = 0;
-        for (let z = 0; z < nz; z++) {
-            for (let y = 0; y < ny; y++) {
-                for (let x = 0; x < nx; x++, linear++) {
-                    bits[linear] = this._maskVolume.getVoxel(x, y, z) === classId ? 1 : 0;
-                }
-            }
-        }
+        this.forEachVoxelOfClass(classId, (_x, _y, _z, linear) => {
+            bits[linear] = 1;
+        });
         return bits;
     }
 

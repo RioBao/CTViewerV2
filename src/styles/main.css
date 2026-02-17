@@ -811,6 +811,76 @@ button.active {
     cursor: not-allowed;
 }
 
+.seg-ai-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    border: 1px solid var(--sep);
+    border-radius: 8px;
+    background: rgba(20, 26, 34, 0.72);
+    padding: 8px;
+}
+
+.seg-ai-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.seg-ai-title {
+    color: #dbe6f2;
+    font-size: 0.74rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+}
+
+.seg-ai-chip {
+    display: inline-flex;
+    align-items: center;
+    height: 20px;
+    padding: 0 7px;
+    border-radius: 999px;
+    border: 1px solid rgba(238, 132, 115, 0.45);
+    background: rgba(102, 46, 39, 0.45);
+    color: #ffd4cc;
+    font-size: 0.64rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+}
+
+.seg-ai-status {
+    color: #c8d5e7;
+    font-size: 0.72rem;
+    line-height: 1.35;
+}
+
+.seg-ai-status.error {
+    color: #f7a5a5;
+}
+
+.seg-ai-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: #bfd0e4;
+    font-size: 0.72rem;
+}
+
+.seg-ai-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.seg-ai-hint {
+    color: #93a4bc;
+    font-size: 0.68rem;
+}
+
 .seg-stats-grid {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
@@ -1059,8 +1129,7 @@ button.active {
 }
 
 .viewport-label,
-.lowres-indicator,
-.resolution-indicator {
+.lowres-indicator {
     position: absolute;
     border-radius: 999px;
     padding: 0.2rem 0.55rem;
@@ -1090,14 +1159,6 @@ button.active {
 
 .lowres-indicator.visible {
     display: block;
-}
-
-.resolution-indicator {
-    right: 0.56rem;
-    bottom: 0.56rem;
-    background: rgba(111, 135, 169, 0.2);
-    border: 1px solid rgba(111, 135, 169, 0.62);
-    color: #d8e4f3;
 }
 
 .viewport-3d-controls {
