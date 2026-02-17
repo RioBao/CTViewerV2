@@ -1,7 +1,8 @@
 import * as ort from 'onnxruntime-web/webgpu';
 import type { ViewAxis } from '../types.js';
 
-const SAM2_INPUT_SIZE = 1024;
+const SAM2_FULL_INPUT_SIZE = 1024;
+const SAM2_PREVIEW_INPUT_SIZE = 512;
 const SAM2_MASK_SIZE = 256;
 const SAM2_CACHE_LIMIT = 8;
 const DEFAULT_MASK_THRESHOLD = 0;
@@ -11,11 +12,13 @@ const DEFAULT_ENCODER_URL = getViteEnvString('VITE_SAM2_ENCODER_URL') ?? `${DEFA
 const DEFAULT_DECODER_URL = getViteEnvString('VITE_SAM2_DECODER_URL') ?? `${DEFAULT_MODEL_BASE_URL}/decoder.onnx`;
 const IMAGE_MEAN: [number, number, number] = [0.485, 0.456, 0.406];
 const IMAGE_STD: [number, number, number] = [0.229, 0.224, 0.225];
+const ORT_WASM_ASYNCIFY_MJS_URL = new URL('../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs', import.meta.url).href;
 const ORT_WASM_ASYNCIFY_WASM_URL = new URL('../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm', import.meta.url).href;
 let isOrtWasmConfigured = false;
 
 interface Sam2EmbeddingCacheEntry {
     key: string;
+    inputSize: number;
     imageEmbed: ort.Tensor;
     highResFeat0: ort.Tensor;
     highResFeat1: ort.Tensor;
@@ -39,7 +42,10 @@ export interface Sam2SliceRequest {
     pointLabel: 0 | 1;
     windowMin: number;
     windowMax: number;
+    inferenceQuality?: Sam2InferenceQuality;
 }
+
+export type Sam2InferenceQuality = 'preview' | 'full';
 
 export interface Sam2SliceTimings {
     encodeMs: number;
@@ -51,6 +57,7 @@ export interface Sam2SliceResult {
     selectedIndices: Uint32Array;
     embeddingCacheHit: boolean;
     iouScore: number;
+    qualityUsed: Sam2InferenceQuality;
     timings: Sam2SliceTimings;
 }
 
@@ -114,6 +121,7 @@ function clamp01(value: number): number {
 }
 
 function disposeTensor(tensor: ort.Tensor | null | undefined): void {
+    if (!tensor) return;
     const disposable = tensor as unknown as { dispose?: () => void };
     if (typeof disposable.dispose === 'function') {
         try {
@@ -137,7 +145,9 @@ function configureOrtWasmRuntime(): void {
 
     ort.env.logLevel = 'error';
     ort.env.wasm.wasmPaths = {
-        // WebGPU bundle expects the asyncify runtime. Force wasm URL so Vite serves a real binary (not index.html fallback).
+        // ORT 1.23.x webgpu build uses the asyncify runtime. Provide both module + wasm URLs explicitly so
+        // Vite serves binaries from node_modules instead of falling back to index.html.
+        mjs: ORT_WASM_ASYNCIFY_MJS_URL,
         wasm: ORT_WASM_ASYNCIFY_WASM_URL,
     };
 
@@ -162,9 +172,13 @@ export class Sam2SliceService {
     private encoderSession: ort.InferenceSession | null = null;
     private decoderSession: ort.InferenceSession | null = null;
     private encoderInputName = 'input_image';
+    private encoderInputBuffer: Float32Array | null = null;
+    private encoderInputTensor: ort.Tensor | null = null;
+    private encoderInputSize = 0;
     private initPromise: Promise<void> | null = null;
     private embeddingCache = new Map<string, Sam2EmbeddingCacheEntry>();
     private usingWasmFallback = false;
+    private previewInputSizeSupported: boolean | null = null;
 
     constructor(options: Sam2SliceServiceOptions = {}) {
         this.encoderModelUrl = options.encoderModelUrl ?? DEFAULT_ENCODER_URL;
@@ -176,6 +190,10 @@ export class Sam2SliceService {
 
     isUsingWasmFallback(): boolean {
         return this.usingWasmFallback;
+    }
+
+    isInitialized(): boolean {
+        return !!(this.encoderSession && this.decoderSession);
     }
 
     async segmentFromClick(request: Sam2SliceRequest): Promise<Sam2SliceResult> {
@@ -194,6 +212,7 @@ export class Sam2SliceService {
                     selectedIndices: new Uint32Array(0),
                     embeddingCacheHit: false,
                     iouScore: 0,
+                    qualityUsed: 'full',
                     timings: { encodeMs: 0, decodeMs: 0, totalMs: 0 },
                 };
             }
@@ -208,10 +227,13 @@ export class Sam2SliceService {
             const windowMin = Number.isFinite(request.windowMin) ? request.windowMin : 0;
             const windowMaxRaw = Number.isFinite(request.windowMax) ? request.windowMax : windowMin + 1;
             const windowMax = Math.max(windowMin + 1e-6, windowMaxRaw);
+            const requestedQuality: Sam2InferenceQuality = request.inferenceQuality === 'preview' ? 'preview' : 'full';
+            let qualityUsed: Sam2InferenceQuality = requestedQuality;
+            let inputSize = this.resolveInputSize(requestedQuality);
 
-            const cacheKey = this.buildCacheKey(request, width, height, windowMin, windowMax);
             const encodeStartAt = performance.now();
-            const cached = this.embeddingCache.get(cacheKey);
+            let cacheKey = this.buildCacheKey(request, width, height, windowMin, windowMax, inputSize);
+            let cached = this.embeddingCache.get(cacheKey);
             let embedding: Sam2EmbeddingCacheEntry;
             let cacheHit = false;
             if (cached) {
@@ -220,7 +242,31 @@ export class Sam2SliceService {
                 this.embeddingCache.delete(cacheKey);
                 this.embeddingCache.set(cacheKey, cached);
             } else {
-                embedding = await this.computeEmbedding(cacheKey, request.values, width, height, windowMin, windowMax);
+                try {
+                    embedding = await this.computeEmbedding(cacheKey, request.values, width, height, windowMin, windowMax, inputSize);
+                } catch (error) {
+                    if (
+                        requestedQuality === 'preview'
+                        && inputSize !== SAM2_FULL_INPUT_SIZE
+                        && this.isLikelyInputShapeError(error)
+                    ) {
+                        this.previewInputSizeSupported = false;
+                        qualityUsed = 'full';
+                        inputSize = SAM2_FULL_INPUT_SIZE;
+                        cacheKey = this.buildCacheKey(request, width, height, windowMin, windowMax, inputSize);
+                        cached = this.embeddingCache.get(cacheKey);
+                        if (cached) {
+                            cacheHit = true;
+                            embedding = cached;
+                            this.embeddingCache.delete(cacheKey);
+                            this.embeddingCache.set(cacheKey, cached);
+                        } else {
+                            embedding = await this.computeEmbedding(cacheKey, request.values, width, height, windowMin, windowMax, inputSize);
+                        }
+                    } else {
+                        throw error;
+                    }
+                }
                 this.embeddingCache.set(cacheKey, embedding);
                 this.trimCache();
             }
@@ -230,9 +276,8 @@ export class Sam2SliceService {
             const { inputs, temporaries } = this.buildDecoderInputs(embedding, width, height, pointX, pointY, pointLabel);
             let selectedIndices = new Uint32Array(0);
             let iouScore = 0;
-            let decoderOutputs: Record<string, ort.Tensor> | null = null;
             try {
-                decoderOutputs = await this.decoderSession!.run(inputs);
+                const decoderOutputs = await this.decoderSession!.run(inputs);
                 const masks = getRequiredTensor(decoderOutputs, 'masks');
                 const iouPredictions = getRequiredTensor(decoderOutputs, 'iou_predictions');
                 const decoded = await this.decodeMasksToIndices(masks, iouPredictions, width, height);
@@ -242,11 +287,6 @@ export class Sam2SliceService {
                 for (const tensor of temporaries) {
                     disposeTensor(tensor);
                 }
-                if (decoderOutputs) {
-                    for (const tensor of Object.values(decoderOutputs)) {
-                        disposeTensor(tensor);
-                    }
-                }
             }
             const decodeMs = performance.now() - decodeStartAt;
 
@@ -254,6 +294,7 @@ export class Sam2SliceService {
                 selectedIndices,
                 embeddingCacheHit: cacheHit,
                 iouScore,
+                qualityUsed,
                 timings: {
                     encodeMs,
                     decodeMs,
@@ -264,10 +305,6 @@ export class Sam2SliceService {
             if (allowWebGpuRecoveryRetry && this.shouldRecoverWebGpu(error)) {
                 await this.recoverWebGpuSessions(error);
                 return this.segmentFromClickInternal(request, false);
-            }
-            if (this.shouldRecoverWebGpu(error)) {
-                const message = error instanceof Error ? error.message : String(error);
-                throw new Error(`SAM2 WebGPU failed after a recovery retry. ${message}`);
             }
             throw error;
         }
@@ -283,6 +320,10 @@ export class Sam2SliceService {
     dispose(): void {
         this.clearEmbeddingCache();
         this.releaseSessionsSilently();
+        disposeTensor(this.encoderInputTensor);
+        this.encoderInputBuffer = null;
+        this.encoderInputTensor = null;
+        this.encoderInputSize = 0;
         this.initPromise = null;
     }
 
@@ -312,32 +353,31 @@ export class Sam2SliceService {
             assertModelUrlIsBinary(this.decoderModelUrl, 'SAM2 decoder model'),
         ]);
 
-        // Try WebGPU first, fall back to WASM/CPU if it fails.
-        const providers: Array<{ name: string; options: ort.InferenceSession.SessionOptions }> = [
-            { name: 'WebGPU', options: { executionProviders: ['webgpu'] } },
-            { name: 'WASM (CPU)', options: { executionProviders: ['wasm'] } },
-        ];
-
-        for (const { name, options } of providers) {
-            try {
-                this.encoderSession = await ort.InferenceSession.create(this.encoderModelUrl, options);
-                this.encoderInputName = this.resolveEncoderInputName();
-                this.decoderSession = await ort.InferenceSession.create(this.decoderModelUrl, options);
-                this.usingWasmFallback = name !== 'WebGPU';
-                if (this.usingWasmFallback) {
-                    console.warn(`[SAM2] WebGPU backend failed, using ${name} fallback.`);
-                }
-                return;
-            } catch (error) {
-                console.warn(`[SAM2] ${name} session creation failed:`, error);
-                // Clean up partial state before trying next provider.
-                this.releaseSessionsSilently();
-            }
+        try {
+            // Option 1 hybrid backend: encoder on WebGPU, decoder on WASM.
+            this.encoderSession = await ort.InferenceSession.create(this.encoderModelUrl, {
+                executionProviders: ['webgpu'],
+            });
+            this.encoderInputName = this.resolveEncoderInputName();
+        } catch (error) {
+            this.releaseSessionsSilently();
+            const details = error instanceof Error ? error.message : String(error);
+            throw new Error(`Failed to create SAM2 encoder WebGPU session from "${this.encoderModelUrl}". ${details}`);
         }
 
-        throw new Error(
-            `SAM2 model load failed with all backends. Expected binary model files at "${this.encoderModelUrl}" and "${this.decoderModelUrl}".`,
-        );
+        try {
+            this.decoderSession = await ort.InferenceSession.create(this.decoderModelUrl, {
+                executionProviders: ['wasm'],
+            });
+        } catch (error) {
+            this.releaseSessionsSilently();
+            const details = error instanceof Error ? error.message : String(error);
+            throw new Error(`Failed to create SAM2 decoder WASM session from "${this.decoderModelUrl}". ${details}`);
+        }
+
+        this.usingWasmFallback = false;
+        const ortVersion = (ort.env as unknown as { versions?: { common?: string } }).versions?.common ?? 'unknown';
+        console.info(`[SAM2] ORT ${ortVersion} backend mode: encoder=webgpu, decoder=wasm`);
     }
 
     private buildCacheKey(
@@ -346,15 +386,29 @@ export class Sam2SliceService {
         height: number,
         windowMin: number,
         windowMax: number,
+        inputSize: number,
     ): string {
         return [
             request.volumeKey,
             request.axis,
             request.sliceIndex,
             `${width}x${height}`,
+            `enc=${inputSize}`,
             windowMin.toFixed(4),
             windowMax.toFixed(4),
         ].join('|');
+    }
+
+    private resolveInputSize(quality: Sam2InferenceQuality): number {
+        if (quality === 'preview' && this.previewInputSizeSupported !== false) {
+            return SAM2_PREVIEW_INPUT_SIZE;
+        }
+        return SAM2_FULL_INPUT_SIZE;
+    }
+
+    private isLikelyInputShapeError(error: unknown): boolean {
+        const message = error instanceof Error ? error.message : String(error);
+        return /shape|dimension|mismatch|invalid input|invalid dimensions|inferred/i.test(message);
     }
 
     private async computeEmbedding(
@@ -364,55 +418,64 @@ export class Sam2SliceService {
         height: number,
         windowMin: number,
         windowMax: number,
+        inputSize: number,
     ): Promise<Sam2EmbeddingCacheEntry> {
-        const inputData = this.prepareEncoderInput(values, width, height, windowMin, windowMax);
-        const imageTensor = new ort.Tensor('float32', inputData, [1, 3, SAM2_INPUT_SIZE, SAM2_INPUT_SIZE]);
-        let outputs: Record<string, ort.Tensor> | null = null;
-        try {
-            outputs = await this.encoderSession!.run({ [this.encoderInputName]: imageTensor });
-            const imageEmbed = await this.toCpuFloat32Tensor(getRequiredTensor(outputs, 'image_embed'));
-            const highResFeat0 = await this.toCpuFloat32Tensor(getRequiredTensor(outputs, 'high_res_feats_0'));
-            const highResFeat1 = await this.toCpuFloat32Tensor(getRequiredTensor(outputs, 'high_res_feats_1'));
-            return {
-                key: cacheKey,
-                imageEmbed,
-                highResFeat0,
-                highResFeat1,
-            };
-        } finally {
-            disposeTensor(imageTensor);
-            if (outputs) {
-                for (const tensor of Object.values(outputs)) {
-                    disposeTensor(tensor);
-                }
-            }
+        const { tensor: imageTensor, buffer: inputData } = this.getReusableEncoderInputTensor(inputSize);
+        this.prepareEncoderInput(inputData, values, width, height, windowMin, windowMax, inputSize);
+        const outputs = await this.encoderSession!.run({ [this.encoderInputName]: imageTensor });
+        const imageEmbed = await this.toCpuFloat32Tensor(getRequiredTensor(outputs, 'image_embed'));
+        const highResFeat0 = await this.toCpuFloat32Tensor(getRequiredTensor(outputs, 'high_res_feats_0'));
+        const highResFeat1 = await this.toCpuFloat32Tensor(getRequiredTensor(outputs, 'high_res_feats_1'));
+        return {
+            key: cacheKey,
+            inputSize,
+            imageEmbed,
+            highResFeat0,
+            highResFeat1,
+        };
+    }
+
+    private getReusableEncoderInputTensor(inputSize: number): { tensor: ort.Tensor; buffer: Float32Array } {
+        if (
+            !this.encoderInputBuffer
+            || !this.encoderInputTensor
+            || this.encoderInputSize !== inputSize
+        ) {
+            disposeTensor(this.encoderInputTensor);
+            this.encoderInputBuffer = new Float32Array(3 * inputSize * inputSize);
+            this.encoderInputTensor = new ort.Tensor('float32', this.encoderInputBuffer, [1, 3, inputSize, inputSize]);
+            this.encoderInputSize = inputSize;
         }
+        return {
+            tensor: this.encoderInputTensor,
+            buffer: this.encoderInputBuffer,
+        };
     }
 
     private prepareEncoderInput(
+        out: Float32Array,
         values: Float32Array,
         width: number,
         height: number,
         windowMin: number,
         windowMax: number,
-    ): Float32Array {
-        const out = new Float32Array(3 * SAM2_INPUT_SIZE * SAM2_INPUT_SIZE);
-        const planeSize = SAM2_INPUT_SIZE * SAM2_INPUT_SIZE;
+        inputSize: number,
+    ): void {
+        const planeSize = inputSize * inputSize;
         const invRange = 1 / Math.max(1e-6, windowMax - windowMin);
 
-        for (let y = 0; y < SAM2_INPUT_SIZE; y++) {
-            const sy = Math.min(height - 1, Math.floor((y * height) / SAM2_INPUT_SIZE));
-            for (let x = 0; x < SAM2_INPUT_SIZE; x++) {
-                const sx = Math.min(width - 1, Math.floor((x * width) / SAM2_INPUT_SIZE));
+        for (let y = 0; y < inputSize; y++) {
+            const sy = Math.min(height - 1, Math.floor((y * height) / inputSize));
+            for (let x = 0; x < inputSize; x++) {
+                const sx = Math.min(width - 1, Math.floor((x * width) / inputSize));
                 const srcIndex = sy * width + sx;
                 const gray = clamp01((values[srcIndex] - windowMin) * invRange);
-                const dstIndex = y * SAM2_INPUT_SIZE + x;
+                const dstIndex = y * inputSize + x;
                 out[dstIndex] = (gray - IMAGE_MEAN[0]) / IMAGE_STD[0];
                 out[planeSize + dstIndex] = (gray - IMAGE_MEAN[1]) / IMAGE_STD[1];
                 out[2 * planeSize + dstIndex] = (gray - IMAGE_MEAN[2]) / IMAGE_STD[2];
             }
         }
-        return out;
     }
 
     private buildDecoderInputs(
@@ -423,8 +486,8 @@ export class Sam2SliceService {
         pointY: number,
         pointLabel: 0 | 1,
     ): { inputs: Record<string, ort.Tensor>; temporaries: ort.Tensor[] } {
-        const scaleX = width > 1 ? (SAM2_INPUT_SIZE - 1) / (width - 1) : 0;
-        const scaleY = height > 1 ? (SAM2_INPUT_SIZE - 1) / (height - 1) : 0;
+        const scaleX = width > 1 ? (embedding.inputSize - 1) / (width - 1) : 0;
+        const scaleY = height > 1 ? (embedding.inputSize - 1) / (height - 1) : 0;
         const pointCoords = new Float32Array([
             pointX * scaleX,
             pointY * scaleY,
@@ -464,7 +527,9 @@ export class Sam2SliceService {
         const iouData = await this.readFloat32TensorData(iouPredictions);
 
         const maskCount = masks.dims[1] ?? 1;
-        const area = SAM2_MASK_SIZE * SAM2_MASK_SIZE;
+        const maskHeight = Math.max(1, Math.floor(masks.dims[2] ?? SAM2_MASK_SIZE));
+        const maskWidth = Math.max(1, Math.floor(masks.dims[3] ?? SAM2_MASK_SIZE));
+        const area = maskWidth * maskHeight;
         let bestMaskIndex = 0;
         let bestIou = -Infinity;
         for (let i = 0; i < maskCount; i++) {
@@ -479,11 +544,11 @@ export class Sam2SliceService {
         const out = new Uint32Array(width * height);
         let count = 0;
         for (let y = 0; y < height; y++) {
-            const my = Math.min(SAM2_MASK_SIZE - 1, Math.floor((y * SAM2_MASK_SIZE) / height));
-            const rowBase = my * SAM2_MASK_SIZE;
+            const my = Math.min(maskHeight - 1, Math.floor((y * maskHeight) / height));
+            const rowBase = my * maskWidth;
             const dstRow = y * width;
             for (let x = 0; x < width; x++) {
-                const mx = Math.min(SAM2_MASK_SIZE - 1, Math.floor((x * SAM2_MASK_SIZE) / width));
+                const mx = Math.min(maskWidth - 1, Math.floor((x * maskWidth) / width));
                 const maskLogit = masksData[bestOffset + rowBase + mx];
                 if (maskLogit > this.maskThreshold) {
                     out[count++] = dstRow + x;
@@ -531,12 +596,8 @@ export class Sam2SliceService {
             return maybe.data;
         }
         if (typeof maybe.getData === 'function') {
-            // Download GPU data to CPU WITHOUT releasing the GPU buffer (releaseData=false).
-            // The GPU buffer is freed later by disposeTensor() — using getData(true) here
-            // would release the buffer back to ORT's pool prematurely, causing a
-            // double-free when dispose() also tries to release it ("buffer used in submit
-            // while destroyed").
-            const downloaded = await maybe.getData(false);
+            // Download to CPU and let ORT release the backing GPU resources safely.
+            const downloaded = await maybe.getData(true);
             if (downloaded instanceof Float32Array) {
                 return downloaded;
             }
@@ -559,9 +620,14 @@ export class Sam2SliceService {
 
     private async recoverWebGpuSessions(error: unknown): Promise<void> {
         const message = error instanceof Error ? error.message : String(error);
-        console.warn(`[SAM2] ORT WebGPU failed, recreating sessions. ${message}`);
+        console.warn(`[SAM2] WebGPU inference failed; recreating SAM2 sessions and retrying once. ${message}`);
         this.clearEmbeddingCache();
         this.releaseSessionsSilently();
+        disposeTensor(this.encoderInputTensor);
+        this.encoderInputTensor = null;
+        this.encoderInputBuffer = null;
+        this.encoderInputSize = 0;
+        this.usingWasmFallback = false;
         this.initPromise = null;
         await this.ensureInitialized();
     }

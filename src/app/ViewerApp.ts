@@ -18,7 +18,7 @@ import { SegmentationGpuCompute } from '../segmentation/SegmentationGpuCompute.j
 import { ROIRegistry } from '../segmentation/ROIRegistry.js';
 import { SegmentationStore, type SegmentationTilesSnapshot } from '../segmentation/SegmentationStore.js';
 import type { BinaryMaskRLEJson } from '../segmentation/MaskPersistence.js';
-import { Sam2SliceService } from '../ai/Sam2SliceService.js';
+import { Sam2SliceService, type Sam2InferenceQuality } from '../ai/Sam2SliceService.js';
 
 const DEG = Math.PI / 180;
 const AXES: ViewAxis[] = ['xy', 'xz', 'yz'];
@@ -112,8 +112,14 @@ interface SmartRegionPreview {
     width: number;
     height: number;
     classId: number;
+    volumeKey: string;
+    pointX: number;
+    pointY: number;
     pointLabel: 0 | 1;
+    windowMin: number;
+    windowMax: number;
     iouScore: number;
+    qualityUsed: Sam2InferenceQuality;
     selectedIndices: Uint32Array;
 }
 
@@ -2699,6 +2705,20 @@ export class ViewerApp {
         return this.smartRegionService;
     }
 
+    private buildSmartRegionVolumeKey(volume: VolumeData | StreamingVolumeData): string {
+        return `${this.uiState.state.fileName}|${volume.dimensions.join('x')}|${volume.dataType}`;
+    }
+
+    private getSmartRegionWindow(volume: VolumeData | StreamingVolumeData): { windowMin: number; windowMax: number } {
+        const windowMinCandidate = Math.min(this.displayWindowMin, this.displayWindowMax);
+        const windowMaxCandidate = Math.max(this.displayWindowMin, this.displayWindowMax);
+        const windowMin = Number.isFinite(windowMinCandidate) ? windowMinCandidate : volume.min;
+        const windowMax = Number.isFinite(windowMaxCandidate) && windowMaxCandidate > windowMin
+            ? windowMaxCandidate
+            : Math.max(windowMin + 1e-6, volume.max);
+        return { windowMin, windowMax };
+    }
+
     private setSmartRegionStatus(message: string, isError = false): void {
         if (!this.segAIStatusEl) return;
         this.segAIStatusEl.textContent = message;
@@ -2719,10 +2739,10 @@ export class ViewerApp {
             this.segAIPreviewToggle.checked = this.smartRegionPreviewOnly;
         }
         if (this.segAIApplyPreviewBtn) {
-            this.segAIApplyPreviewBtn.disabled = !this.smartRegionPreview;
+            this.segAIApplyPreviewBtn.disabled = !this.smartRegionPreview || this.segmentationWorkerBusy;
         }
         if (this.segAIClearPreviewBtn) {
-            this.segAIClearPreviewBtn.disabled = !this.smartRegionPreview;
+            this.segAIClearPreviewBtn.disabled = !this.smartRegionPreview || this.segmentationWorkerBusy;
         }
     }
 
@@ -2747,15 +2767,61 @@ export class ViewerApp {
         this.scheduleAxisRender(preview.axis);
     }
 
-    private applySmartRegionPreview(): number {
+    private async applySmartRegionPreview(): Promise<number> {
         const preview = this.smartRegionPreview;
         if (!preview) return 0;
+        let selectedIndices = preview.selectedIndices;
+        let refined = false;
+        const volume = this.volume;
+        const active = this.getActiveRoi();
+        const canRefine =
+            preview.qualityUsed === 'preview'
+            && !!volume
+            && !!active
+            && !active.locked
+            && preview.volumeKey === this.buildSmartRegionVolumeKey(volume);
+
+        if (canRefine) {
+            const slice = volume.getSlice(preview.axis, preview.sliceIndex);
+            const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
+            this.segmentationWorkerBusy = true;
+            this.setActiveRoiBusy(active.id, true);
+            this.refreshSmartRegionPreviewControls();
+            this.setSmartRegionStatus('SAM2 refining full quality...');
+            try {
+                const service = this.getSmartRegionService();
+                const result = await service.segmentFromClick({
+                    volumeKey: preview.volumeKey,
+                    axis: preview.axis,
+                    sliceIndex: preview.sliceIndex,
+                    width: slice.width,
+                    height: slice.height,
+                    values,
+                    pointX: preview.pointX,
+                    pointY: preview.pointY,
+                    pointLabel: preview.pointLabel,
+                    windowMin: preview.windowMin,
+                    windowMax: preview.windowMax,
+                    inferenceQuality: 'full',
+                });
+                this.updateSmartRegionBackendChip(service.isUsingWasmFallback());
+                selectedIndices = result.selectedIndices;
+                refined = true;
+            } catch (error) {
+                console.warn('SAM2 full-quality refine failed; applying fast preview result.', error);
+            } finally {
+                this.segmentationWorkerBusy = false;
+                this.setActiveRoiBusy(active.id, false);
+                this.refreshSmartRegionPreviewControls();
+            }
+        }
+
         const changed = this.applySelectionIndicesToActiveRoi(
             preview.axis,
             preview.sliceIndex,
             preview.width,
             preview.height,
-            preview.selectedIndices,
+            selectedIndices,
         );
         this.clearSmartRegionPreview({ render: true });
         if (changed > 0) {
@@ -2765,7 +2831,7 @@ export class ViewerApp {
             this.schedule3DMaskSync({ immediate: true, render: true });
         }
         this.setSmartRegionStatus(
-            `SAM2 preview applied: ${preview.selectedIndices.length.toLocaleString()} voxels (${changed.toLocaleString()} changed).`,
+            `SAM2 ${refined ? 'refined+applied' : 'preview applied'}: ${selectedIndices.length.toLocaleString()} voxels (${changed.toLocaleString()} changed).`,
         );
         return changed;
     }
@@ -2942,6 +3008,7 @@ export class ViewerApp {
         } finally {
             this.segmentationWorkerBusy = false;
             this.setActiveRoiBusy(active.id, false);
+            this.refreshSmartRegionPreviewControls();
         }
     }
 
@@ -3017,21 +3084,23 @@ export class ViewerApp {
         const values = slice.data instanceof Float32Array ? slice.data : new Float32Array(slice.data);
         const pointX = Math.max(0, Math.min(slice.width - 1, Math.floor(hit.sliceX)));
         const pointY = Math.max(0, Math.min(slice.height - 1, Math.floor(hit.sliceY)));
-        const windowMinCandidate = Math.min(this.displayWindowMin, this.displayWindowMax);
-        const windowMaxCandidate = Math.max(this.displayWindowMin, this.displayWindowMax);
-        const windowMin = Number.isFinite(windowMinCandidate) ? windowMinCandidate : volume.min;
-        const windowMax = Number.isFinite(windowMaxCandidate) && windowMaxCandidate > windowMin
-            ? windowMaxCandidate
-            : Math.max(windowMin + 1e-6, volume.max);
+        const volumeKey = this.buildSmartRegionVolumeKey(volume);
+        const { windowMin, windowMax } = this.getSmartRegionWindow(volume);
+        const inferenceQuality: Sam2InferenceQuality = this.smartRegionPreviewOnly ? 'preview' : 'full';
 
         this.segmentationWorkerBusy = true;
         this.setActiveRoiBusy(active.id, true);
-        this.setSmartRegionStatus('SAM2 running...');
+        this.refreshSmartRegionPreviewControls();
         const startedAt = performance.now();
         try {
             const service = this.getSmartRegionService();
+            if (!service.isInitialized()) {
+                this.setSmartRegionStatus('SAM2 loading model files (first run may take a while)...');
+            } else {
+                this.setSmartRegionStatus('SAM2 running...');
+            }
             const result = await service.segmentFromClick({
-                volumeKey: `${this.uiState.state.fileName}|${volume.dimensions.join('x')}|${volume.dataType}`,
+                volumeKey,
                 axis,
                 sliceIndex: hit.sliceIndex,
                 width: slice.width,
@@ -3042,11 +3111,13 @@ export class ViewerApp {
                 pointLabel,
                 windowMin,
                 windowMax,
+                inferenceQuality,
             });
             this.updateSmartRegionBackendChip(service.isUsingWasmFallback());
             const totalMs = performance.now() - startedAt;
             const cacheTag = result.embeddingCacheHit ? 'cache' : 'encoded';
             const promptTag = pointLabel === 1 ? '+' : '-';
+            const qualityTag = result.qualityUsed === 'preview' ? 'fast' : 'full';
 
             let changed = 0;
             if (this.smartRegionPreviewOnly) {
@@ -3056,12 +3127,18 @@ export class ViewerApp {
                     width: slice.width,
                     height: slice.height,
                     classId: active.classId,
+                    volumeKey,
+                    pointX,
+                    pointY,
                     pointLabel,
+                    windowMin,
+                    windowMax,
                     iouScore: result.iouScore,
+                    qualityUsed: result.qualityUsed,
                     selectedIndices: result.selectedIndices,
                 });
                 this.setSmartRegionStatus(
-                    `SAM2 ${promptTag} preview: ${result.selectedIndices.length.toLocaleString()} voxels (${cacheTag}, ${totalMs.toFixed(0)}ms).`,
+                    `SAM2 ${promptTag} preview (${qualityTag}): ${result.selectedIndices.length.toLocaleString()} voxels (${cacheTag}, ${totalMs.toFixed(0)}ms).`,
                 );
             } else {
                 this.clearSmartRegionPreview({ render: true });
@@ -3073,7 +3150,7 @@ export class ViewerApp {
                     result.selectedIndices,
                 );
                 this.setSmartRegionStatus(
-                    `SAM2 ${promptTag}: ${result.selectedIndices.length.toLocaleString()} voxels (${cacheTag}, ${totalMs.toFixed(0)}ms)`,
+                    `SAM2 ${promptTag} (${qualityTag}): ${result.selectedIndices.length.toLocaleString()} voxels (${cacheTag}, ${totalMs.toFixed(0)}ms)`,
                 );
                 if (changed > 0) {
                     this.invalidateActiveRoiStats();
@@ -3085,7 +3162,7 @@ export class ViewerApp {
             }
             this.refreshSmartRegionPreviewControls();
             console.info(
-                `[SmartRegion] axis=${axis} slice=${hit.sliceIndex} selected=${result.selectedIndices.length} changed=${changed} preview=${this.smartRegionPreviewOnly} total=${totalMs.toFixed(2)}ms encode=${result.timings.encodeMs.toFixed(2)}ms decode=${result.timings.decodeMs.toFixed(2)}ms iou=${result.iouScore.toFixed(3)} cache=${result.embeddingCacheHit ? 'hit' : 'miss'}`,
+                `[SmartRegion] axis=${axis} slice=${hit.sliceIndex} selected=${result.selectedIndices.length} changed=${changed} preview=${this.smartRegionPreviewOnly} quality=${result.qualityUsed} total=${totalMs.toFixed(2)}ms encode=${result.timings.encodeMs.toFixed(2)}ms decode=${result.timings.decodeMs.toFixed(2)}ms iou=${result.iouScore.toFixed(3)} cache=${result.embeddingCacheHit ? 'hit' : 'miss'}`,
             );
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -4130,10 +4207,12 @@ export class ViewerApp {
         }
         if (this.segAIApplyPreviewBtn) {
             this.segAIApplyPreviewBtn.addEventListener('click', () => {
-                const changed = this.applySmartRegionPreview();
-                if (changed === 0 && !this.smartRegionPreview) {
-                    this.setSmartRegionStatus('No SAM2 preview to apply.');
-                }
+                void (async () => {
+                    const changed = await this.applySmartRegionPreview();
+                    if (changed === 0 && !this.smartRegionPreview) {
+                        this.setSmartRegionStatus('No SAM2 preview to apply.');
+                    }
+                })();
             });
         }
         if (this.segAIClearPreviewBtn) {
