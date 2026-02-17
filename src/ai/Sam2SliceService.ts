@@ -164,6 +164,7 @@ export class Sam2SliceService {
     private encoderInputName = 'input_image';
     private initPromise: Promise<void> | null = null;
     private embeddingCache = new Map<string, Sam2EmbeddingCacheEntry>();
+    private usingWasmFallback = false;
 
     constructor(options: Sam2SliceServiceOptions = {}) {
         this.encoderModelUrl = options.encoderModelUrl ?? DEFAULT_ENCODER_URL;
@@ -174,7 +175,7 @@ export class Sam2SliceService {
     }
 
     isUsingWasmFallback(): boolean {
-        return false;
+        return this.usingWasmFallback;
     }
 
     async segmentFromClick(request: Sam2SliceRequest): Promise<Sam2SliceResult> {
@@ -306,36 +307,37 @@ export class Sam2SliceService {
     }
 
     private async initSessions(): Promise<void> {
-        const sessionOptions: ort.InferenceSession.SessionOptions = {
-            executionProviders: ['webgpu'],
-            graphOptimizationLevel: 'disabled',
-            enableGraphCapture: false,
-        };
+        await Promise.all([
+            assertModelUrlIsBinary(this.encoderModelUrl, 'SAM2 encoder model'),
+            assertModelUrlIsBinary(this.decoderModelUrl, 'SAM2 decoder model'),
+        ]);
 
-        try {
-            await Promise.all([
-                assertModelUrlIsBinary(this.encoderModelUrl, 'SAM2 encoder model'),
-                assertModelUrlIsBinary(this.decoderModelUrl, 'SAM2 decoder model'),
-            ]);
+        // Try WebGPU first, fall back to WASM/CPU if it fails.
+        const providers: Array<{ name: string; options: ort.InferenceSession.SessionOptions }> = [
+            { name: 'WebGPU', options: { executionProviders: ['webgpu'] } },
+            { name: 'WASM (CPU)', options: { executionProviders: ['wasm'] } },
+        ];
+
+        for (const { name, options } of providers) {
             try {
-                this.encoderSession = await ort.InferenceSession.create(this.encoderModelUrl, sessionOptions);
+                this.encoderSession = await ort.InferenceSession.create(this.encoderModelUrl, options);
                 this.encoderInputName = this.resolveEncoderInputName();
+                this.decoderSession = await ort.InferenceSession.create(this.decoderModelUrl, options);
+                this.usingWasmFallback = name !== 'WebGPU';
+                if (this.usingWasmFallback) {
+                    console.warn(`[SAM2] WebGPU backend failed, using ${name} fallback.`);
+                }
+                return;
             } catch (error) {
-                const details = error instanceof Error ? error.message : String(error);
-                throw new Error(`Failed to create SAM2 encoder session from "${this.encoderModelUrl}". ${details}`);
+                console.warn(`[SAM2] ${name} session creation failed:`, error);
+                // Clean up partial state before trying next provider.
+                this.releaseSessionsSilently();
             }
-            try {
-                this.decoderSession = await ort.InferenceSession.create(this.decoderModelUrl, sessionOptions);
-            } catch (error) {
-                const details = error instanceof Error ? error.message : String(error);
-                throw new Error(`Failed to create SAM2 decoder session from "${this.decoderModelUrl}". ${details}`);
-            }
-        } catch (error) {
-            const details = error instanceof Error ? error.message : String(error);
-            throw new Error(
-                `SAM2 model load failed. Expected binary model files at "${this.encoderModelUrl}" and "${this.decoderModelUrl}". ${details}`,
-            );
         }
+
+        throw new Error(
+            `SAM2 model load failed with all backends. Expected binary model files at "${this.encoderModelUrl}" and "${this.decoderModelUrl}".`,
+        );
     }
 
     private buildCacheKey(
@@ -557,7 +559,7 @@ export class Sam2SliceService {
 
     private async recoverWebGpuSessions(error: unknown): Promise<void> {
         const message = error instanceof Error ? error.message : String(error);
-        console.warn(`[SmartRegion] ORT WebGPU failed, recreating SAM2 sessions and retrying once. ${message}`);
+        console.warn(`[SAM2] ORT WebGPU failed, recreating sessions. ${message}`);
         this.clearEmbeddingCache();
         this.releaseSessionsSilently();
         this.initPromise = null;
