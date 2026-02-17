@@ -529,8 +529,12 @@ export class Sam2SliceService {
             return maybe.data;
         }
         if (typeof maybe.getData === 'function') {
-            // Let ORT release GPU-side tensor data after download to avoid manual-dispose races.
-            const downloaded = await maybe.getData(true);
+            // Download GPU data to CPU WITHOUT releasing the GPU buffer (releaseData=false).
+            // The GPU buffer is freed later by disposeTensor() — using getData(true) here
+            // would release the buffer back to ORT's pool prematurely, causing a
+            // double-free when dispose() also tries to release it ("buffer used in submit
+            // while destroyed").
+            const downloaded = await maybe.getData(false);
             if (downloaded instanceof Float32Array) {
                 return downloaded;
             }
