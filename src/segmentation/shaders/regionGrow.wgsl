@@ -46,12 +46,18 @@ fn region_grow_persistent() {
         let tail = atomicLoad(&state.writeTail);
 
         if (head < tail) {
+            // Signal active intent BEFORE claiming so the termination check
+            // never sees activeWorkers==0 while a thread is between CAS and
+            // processing (which would cause premature exit and serial fallback).
+            atomicAdd(&state.activeWorkers, 1u);
+
             let claim = atomicCompareExchangeWeak(&state.readHead, head, head + 1u);
             if (claim.old_value != head) {
+                // CAS failed — another thread claimed this slot; undo and retry.
+                atomicSub(&state.activeWorkers, 1u);
                 continue;
             }
 
-            atomicAdd(&state.activeWorkers, 1u);
             let idx = queue[head];
             let x = idx % params.width;
             let y = idx / params.width;
@@ -76,6 +82,8 @@ fn region_grow_persistent() {
             continue;
         }
 
+        // Queue appears empty — exit only when no thread is mid-processing
+        // (they could still be adding new items to the queue).
         if (atomicLoad(&state.activeWorkers) == 0u) {
             if (atomicLoad(&state.readHead) >= atomicLoad(&state.writeTail)) {
                 break;
