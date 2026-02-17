@@ -236,8 +236,6 @@ export class Sam2SliceService {
                 const decoded = await this.decodeMasksToIndices(masks, iouPredictions, width, height);
                 selectedIndices = new Uint32Array(decoded.selectedIndices);
                 iouScore = decoded.iouScore;
-                disposeTensor(masks);
-                disposeTensor(iouPredictions);
             } finally {
                 for (const tensor of temporaries) {
                     disposeTensor(tensor);
@@ -497,7 +495,6 @@ export class Sam2SliceService {
         const data = await this.readFloat32TensorData(tensor);
         const dims = [...tensor.dims];
         const cpuTensor = new ort.Tensor('float32', new Float32Array(data), dims);
-        disposeTensor(tensor);
         return cpuTensor;
     }
 
@@ -510,7 +507,8 @@ export class Sam2SliceService {
             return maybe.data;
         }
         if (typeof maybe.getData === 'function') {
-            const downloaded = await maybe.getData(false);
+            // Let ORT release GPU-side tensor data after download to avoid manual-dispose races.
+            const downloaded = await maybe.getData(true);
             if (downloaded instanceof Float32Array) {
                 return downloaded;
             }
