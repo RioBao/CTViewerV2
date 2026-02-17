@@ -229,8 +229,9 @@ export class Sam2SliceService {
             const { inputs, temporaries } = this.buildDecoderInputs(embedding, width, height, pointX, pointY, pointLabel);
             let selectedIndices = new Uint32Array(0);
             let iouScore = 0;
+            let decoderOutputs: Record<string, ort.Tensor> | null = null;
             try {
-                const decoderOutputs = await this.decoderSession!.run(inputs);
+                decoderOutputs = await this.decoderSession!.run(inputs);
                 const masks = getRequiredTensor(decoderOutputs, 'masks');
                 const iouPredictions = getRequiredTensor(decoderOutputs, 'iou_predictions');
                 const decoded = await this.decodeMasksToIndices(masks, iouPredictions, width, height);
@@ -239,6 +240,11 @@ export class Sam2SliceService {
             } finally {
                 for (const tensor of temporaries) {
                     disposeTensor(tensor);
+                }
+                if (decoderOutputs) {
+                    for (const tensor of Object.values(decoderOutputs)) {
+                        disposeTensor(tensor);
+                    }
                 }
             }
             const decodeMs = performance.now() - decodeStartAt;
@@ -275,9 +281,19 @@ export class Sam2SliceService {
 
     dispose(): void {
         this.clearEmbeddingCache();
-        this.encoderSession = null;
-        this.decoderSession = null;
+        this.releaseSessionsSilently();
         this.initPromise = null;
+    }
+
+    private releaseSessionsSilently(): void {
+        if (this.encoderSession) {
+            try { this.encoderSession.release(); } catch { /* ignore */ }
+            this.encoderSession = null;
+        }
+        if (this.decoderSession) {
+            try { this.decoderSession.release(); } catch { /* ignore */ }
+            this.decoderSession = null;
+        }
     }
 
     private async ensureInitialized(): Promise<void> {
@@ -349,8 +365,9 @@ export class Sam2SliceService {
     ): Promise<Sam2EmbeddingCacheEntry> {
         const inputData = this.prepareEncoderInput(values, width, height, windowMin, windowMax);
         const imageTensor = new ort.Tensor('float32', inputData, [1, 3, SAM2_INPUT_SIZE, SAM2_INPUT_SIZE]);
+        let outputs: Record<string, ort.Tensor> | null = null;
         try {
-            const outputs = await this.encoderSession!.run({ [this.encoderInputName]: imageTensor });
+            outputs = await this.encoderSession!.run({ [this.encoderInputName]: imageTensor });
             const imageEmbed = await this.toCpuFloat32Tensor(getRequiredTensor(outputs, 'image_embed'));
             const highResFeat0 = await this.toCpuFloat32Tensor(getRequiredTensor(outputs, 'high_res_feats_0'));
             const highResFeat1 = await this.toCpuFloat32Tensor(getRequiredTensor(outputs, 'high_res_feats_1'));
@@ -362,6 +379,11 @@ export class Sam2SliceService {
             };
         } finally {
             disposeTensor(imageTensor);
+            if (outputs) {
+                for (const tensor of Object.values(outputs)) {
+                    disposeTensor(tensor);
+                }
+            }
         }
     }
 
@@ -533,8 +555,7 @@ export class Sam2SliceService {
         const message = error instanceof Error ? error.message : String(error);
         console.warn(`[SmartRegion] ORT WebGPU failed, recreating SAM2 sessions and retrying once. ${message}`);
         this.clearEmbeddingCache();
-        this.encoderSession = null;
-        this.decoderSession = null;
+        this.releaseSessionsSilently();
         this.initPromise = null;
         await this.ensureInitialized();
     }
