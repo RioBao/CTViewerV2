@@ -320,7 +320,6 @@
                                 <h4>Segmentation</h4>
                             </div>
                             <div class="overlay-title-actions">
-                                <button id="segmentationAddRoiBtn" class="icon-btn close-btn" title="Add ROI" aria-label="Add ROI">+</button>
                                 <button id="segmentationPinBtn" class="icon-btn close-btn" title="Pin segmentation panel" aria-label="Pin segmentation panel">
                                     <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
                                         <path d="M8 4h8l-1 5 3 3v1H6v-1l3-3z"></path>
@@ -332,35 +331,32 @@
 
                         <div class="seg-overlay-body">
                             <div class="seg-section">
-                                <div class="seg-section-title">ROI List</div>
+                                <div class="seg-section-title">ROI Layers</div>
                                 <div class="seg-roi-list" id="segRoiList"></div>
+                                <button id="segmentationAddRoiBtn" class="seg-primary-btn" type="button">+ Add ROI</button>
                             </div>
 
                             <div class="seg-section">
-                                <div class="seg-section-title">Active ROI Summary</div>
                                 <div class="seg-active-summary">
-                                    <div class="seg-active-row">
-                                        <span class="seg-active-color" id="segActiveColor"></span>
-                                        <span class="seg-active-name" id="segActiveName">No active ROI</span>
-                                        <span class="seg-active-class" id="segActiveClass">-</span>
-                                    </div>
-                                    <div class="seg-active-state" id="segActiveState">Select an ROI to edit.</div>
-                                    <div class="seg-stats-grid">
+                                    <div class="seg-active-name" id="segActiveName">No ROI selected</div>
+                                    <div class="seg-active-class" id="segActiveClass">-</div>
+                                    <div class="seg-stats-grid" id="segActiveStats">
                                         <span>Voxels</span><span id="segStatsVoxels">-</span>
                                         <span>Volume</span><span id="segStatsVolume">-</span>
                                         <span>Mean Intensity</span><span id="segStatsMean">-</span>
                                         <span>Std Dev</span><span id="segStatsStd">-</span>
                                     </div>
+                                    <div class="seg-active-empty" id="segActiveEmpty">Select an ROI to inspect stats.</div>
                                 </div>
                             </div>
 
                             <div class="seg-section">
                                 <div class="seg-section-title">Display Controls</div>
                                 <div class="control-row">
-                                    <label><input type="checkbox" id="segVisibleToggle" checked> Show Overlay</label>
+                                    <label><input type="checkbox" id="segVisibleToggle" checked> Show overlay</label>
                                 </div>
                                 <div class="control-row">
-                                    <label><input type="checkbox" id="segShowOnlyActiveToggle"> Show only active ROI</label>
+                                    <label><input type="checkbox" id="segShowOnlyActiveToggle"> Show only selected ROI</label>
                                 </div>
                                 <div class="control-row">
                                     <label for="segOpacitySlider">Overlay Opacity <span id="segOpacityValue">0.40</span></label>
@@ -370,13 +366,10 @@
 
                             <div class="seg-section">
                                 <details class="seg-advanced-controls" id="segAdvancedControls">
-                                    <summary class="seg-advanced-toggle">Advanced Controls</summary>
+                                    <summary class="seg-advanced-toggle">Advanced</summary>
                                     <div class="seg-advanced-body">
-                                        <div class="control-row">
-                                            <label><input type="checkbox" id="segEnableToggle"> Enable Editing</label>
-                                        </div>
                                         <div class="seg-action-grid">
-                                            <button id="segExportRoiBtn" class="seg-action-btn" type="button">Export Active ROI</button>
+                                            <button id="segExportRoiBtn" class="seg-action-btn" type="button">Export ROI</button>
                                             <button id="segImportRoiBtn" class="seg-action-btn" type="button">Import ROI</button>
                                             <button id="segExportSegBtn" class="seg-action-btn" type="button">Export Segmentation</button>
                                             <button id="segImportSegBtn" class="seg-action-btn" type="button">Import Segmentation</button>

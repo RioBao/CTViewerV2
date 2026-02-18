@@ -609,7 +609,7 @@ export class ViewerApp {
         if (this.mipRenderer) {
             this.apply3DOverlaySettings();
             const seg = this.uiState.state.segmentation;
-            if ((this.mask3DDirty || this.mask3DPaletteDirty) && this.isSegmentationMode() && seg.visible) {
+            if ((this.mask3DDirty || this.mask3DPaletteDirty) && seg.visible) {
                 this.schedule3DMaskSync({ render: false });
             }
             this.mipRenderer.render();
@@ -631,15 +631,15 @@ export class ViewerApp {
         const index = this.uiState.state.slices[axis];
         const slice = volume.getSlice(axis, index);
         const seg = this.uiState.state.segmentation;
-        renderer.maskOverlayEnabled = !!this.maskVolume && seg.visible && this.isSegmentationMode();
+        renderer.maskOverlayEnabled = !!this.maskVolume && seg.visible;
         renderer.maskOverlayOpacity = seg.overlayOpacity;
         renderer.maskOverlayColor = seg.color;
-        if (this.isSegmentationMode()) {
+        if (this.maskVolume) {
             renderer.setMaskPalette(this.buildMaskPalette());
         }
 
         let maskSliceData: MaskTypedArray | null = null;
-        if (this.maskVolume && this.isSegmentationMode()) {
+        if (this.maskVolume) {
             const maskSlice = this.maskVolume.getSlice(axis, index, this.maskSliceBuffers[axis] ?? undefined);
             this.maskSliceBuffers[axis] = maskSlice.data;
             maskSliceData = this.filterMaskSliceForDisplay(axis, maskSlice.data);
@@ -745,7 +745,7 @@ export class ViewerApp {
     private apply3DOverlaySettings(): void {
         if (!this.mipRenderer) return;
         const seg = this.uiState.state.segmentation;
-        const enabled = !!this.maskVolume && this.isSegmentationMode() && seg.visible;
+        const enabled = !!this.maskVolume && seg.visible;
         this.mipRenderer.setMaskOverlay(enabled, seg.overlayOpacity);
     }
 
@@ -938,7 +938,7 @@ export class ViewerApp {
         }
 
         const seg = this.uiState.state.segmentation;
-        const overlayEnabled = this.isSegmentationMode() && seg.visible;
+        const overlayEnabled = seg.visible;
         if (overlayEnabled && this.mask3DDirty) {
             if (this.maskVolume.getNonZeroVoxelCount() === 0) {
                 mip.clearLabelVolume();
@@ -1476,13 +1476,19 @@ export class ViewerApp {
     }
 
     private updateActiveRoiStatsDisplay(stats: { voxels: number; volume: number; mean: number; std: number } | null): void {
+        const statsGridEl = document.getElementById('segActiveStats') as HTMLElement | null;
+        const statsEmptyEl = document.getElementById('segActiveEmpty') as HTMLElement | null;
         const voxelsEl = document.getElementById('segStatsVoxels');
         const volumeEl = document.getElementById('segStatsVolume');
         const meanEl = document.getElementById('segStatsMean');
         const stdEl = document.getElementById('segStatsStd');
-        if (!voxelsEl || !volumeEl || !meanEl || !stdEl) return;
+        if (!voxelsEl || !volumeEl || !meanEl || !stdEl || !statsGridEl || !statsEmptyEl) return;
 
-        if (!stats) {
+        const hasStats = !!stats && stats.voxels > 0;
+        statsGridEl.style.display = hasStats ? 'grid' : 'none';
+        statsEmptyEl.style.display = hasStats ? 'none' : 'block';
+
+        if (!hasStats || !stats) {
             voxelsEl.textContent = '-';
             volumeEl.textContent = '-';
             meanEl.textContent = '-';
@@ -1550,7 +1556,6 @@ export class ViewerApp {
 
     private refreshSegmentationOverlayUI(): void {
         const seg = this.uiState.state.segmentation;
-        const segEnableToggle = document.getElementById('segEnableToggle') as HTMLInputElement | null;
         const segVisibleToggle = document.getElementById('segVisibleToggle') as HTMLInputElement | null;
         const showOnlyActiveToggle = document.getElementById('segShowOnlyActiveToggle') as HTMLInputElement | null;
         const opacitySlider = document.getElementById('segOpacitySlider') as HTMLInputElement | null;
@@ -1569,11 +1574,9 @@ export class ViewerApp {
         const importSegBtn = document.getElementById('segImportSegBtn') as HTMLButtonElement | null;
         const activeNameEl = document.getElementById('segActiveName');
         const activeClassEl = document.getElementById('segActiveClass');
-        const activeStateEl = document.getElementById('segActiveState');
-        const activeColorEl = document.getElementById('segActiveColor');
+        const activeEmptyEl = document.getElementById('segActiveEmpty');
         const active = this.getActiveRoi();
 
-        if (segEnableToggle) segEnableToggle.checked = seg.enabled;
         if (segVisibleToggle) segVisibleToggle.checked = seg.visible;
         if (showOnlyActiveToggle) showOnlyActiveToggle.checked = seg.showOnlyActive;
         if (opacitySlider) opacitySlider.value = seg.overlayOpacity.toFixed(2);
@@ -1597,16 +1600,15 @@ export class ViewerApp {
         if (exportSegBtn) exportSegBtn.disabled = !this.volume || !this.maskVolume;
         if (importSegBtn) importSegBtn.disabled = !this.volume;
 
-        if (activeNameEl) activeNameEl.textContent = active ? active.name : 'No active ROI';
-        if (activeClassEl) activeClassEl.textContent = active ? `Class ${active.classId}` : '-';
-        if (activeStateEl) {
-            activeStateEl.textContent = active
-                ? (active.locked ? 'Locked for editing' : 'Ready to edit')
-                : 'Select an ROI to edit.';
+        if (activeNameEl) activeNameEl.textContent = active ? active.name : 'No ROI selected';
+        if (activeClassEl) activeClassEl.textContent = active ? `Class ${active.classId}` : 'Class -';
+        if (activeEmptyEl) {
+            activeEmptyEl.textContent = active
+                ? 'No segmentation data yet.'
+                : 'Select an ROI to inspect stats.';
         }
-        if (activeColorEl) {
-            activeColorEl.style.background = active?.colorHex || '#6b7280';
-            activeColorEl.style.opacity = active ? '1' : '0.45';
+        if (!active) {
+            this.updateActiveRoiStatsDisplay(null);
         }
 
         this.refreshSmartRegionPreviewControls();
@@ -1630,7 +1632,6 @@ export class ViewerApp {
             const row = document.createElement('div');
             row.className = 'seg-roi-row';
             if (roi.id === activeId) row.classList.add('active');
-            if (roi.aiBusy) row.classList.add('busy');
             row.title = `Class ${roi.classId}`;
             row.addEventListener('click', () => this.setActiveRoi(roi.id));
 
@@ -1651,21 +1652,93 @@ export class ViewerApp {
                 this.schedule3DMaskSync({ render: true });
             });
 
+            const nameLabel = document.createElement('span');
+            nameLabel.className = 'seg-roi-name';
+            nameLabel.textContent = roi.name;
+            nameLabel.title = 'Click to rename ROI';
+
+            const nameWrap = document.createElement('div');
+            nameWrap.className = 'seg-roi-name-wrap';
+
             const nameInput = document.createElement('input');
             nameInput.type = 'text';
-            nameInput.className = 'seg-roi-name';
+            nameInput.className = 'seg-roi-name-input';
             nameInput.value = roi.name;
-            nameInput.addEventListener('click', (e) => e.stopPropagation());
-            nameInput.addEventListener('change', () => {
-                const trimmed = nameInput.value.trim();
-                roi.name = trimmed || `ROI ${roi.classId}`;
+            nameInput.hidden = true;
+            let nameClickTimer: number | null = null;
+
+            let editingName = false;
+            const beginInlineRename = (): void => {
+                if (editingName) return;
+                editingName = true;
                 nameInput.value = roi.name;
+                nameLabel.hidden = true;
+                nameInput.hidden = false;
+                nameInput.focus();
+                nameInput.select();
+            };
+
+            const finishInlineRename = (commit: boolean): void => {
+                if (!editingName) return;
+                editingName = false;
+                if (commit) {
+                    const trimmed = nameInput.value.trim();
+                    roi.name = trimmed || `ROI ${roi.classId}`;
+                }
+                nameInput.value = roi.name;
+                nameLabel.textContent = roi.name;
+                nameInput.hidden = true;
+                nameLabel.hidden = false;
+                if (this.uiState.state.segmentation.activeROIId === roi.id) {
+                    const activeNameEl = document.getElementById('segActiveName');
+                    if (activeNameEl) activeNameEl.textContent = roi.name;
+                }
+            };
+
+            nameLabel.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (editingName) return;
+                if (nameClickTimer != null) {
+                    clearTimeout(nameClickTimer);
+                }
+                nameClickTimer = window.setTimeout(() => {
+                    nameClickTimer = null;
+                    if (this.uiState.state.segmentation.activeROIId !== roi.id) {
+                        this.setActiveRoi(roi.id);
+                    }
+                }, 220);
             });
+            nameLabel.addEventListener('dblclick', (e) => {
+                e.stopPropagation();
+                if (nameClickTimer != null) {
+                    clearTimeout(nameClickTimer);
+                    nameClickTimer = null;
+                }
+                beginInlineRename();
+            });
+            nameInput.addEventListener('click', (e) => e.stopPropagation());
+            nameInput.addEventListener('mousedown', (e) => e.stopPropagation());
+            nameInput.addEventListener('keydown', (e) => {
+                e.stopPropagation();
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    finishInlineRename(true);
+                    return;
+                }
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    finishInlineRename(false);
+                }
+            });
+            nameInput.addEventListener('blur', () => finishInlineRename(true));
+            nameWrap.append(nameLabel, nameInput);
 
             const visibilityBtn = document.createElement('button');
             visibilityBtn.type = 'button';
-            visibilityBtn.className = `seg-roi-btn${roi.visible ? '' : ' off'}`;
-            visibilityBtn.textContent = roi.visible ? 'Vis' : 'Hide';
+            visibilityBtn.className = `seg-roi-visibility${roi.visible ? '' : ' off'}`;
+            visibilityBtn.title = roi.visible ? 'Hide ROI' : 'Show ROI';
+            visibilityBtn.setAttribute('aria-label', roi.visible ? 'Hide ROI' : 'Show ROI');
+            visibilityBtn.innerHTML = this.getRoiVisibilityIconSvg(roi.visible);
             visibilityBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 roi.visible = !roi.visible;
@@ -1675,70 +1748,119 @@ export class ViewerApp {
                 this.schedule3DMaskSync({ render: true });
             });
 
-            const lockBtn = document.createElement('button');
-            lockBtn.type = 'button';
-            lockBtn.className = `seg-roi-btn${roi.locked ? ' locked' : ''}`;
-            lockBtn.textContent = roi.locked ? 'Lock' : 'Edit';
-            lockBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                roi.locked = !roi.locked;
-                this.refreshSegmentationOverlayUI();
-            });
+            const actionCell = document.createElement('div');
+            actionCell.className = 'seg-roi-action-cell';
 
-            const busyTag = document.createElement('span');
-            busyTag.className = 'seg-roi-busy';
-            busyTag.textContent = roi.aiBusy ? '...' : '';
-
-            const menu = document.createElement('details');
-            menu.className = 'seg-roi-menu';
-            menu.addEventListener('click', (e) => e.stopPropagation());
-
-            const menuSummary = document.createElement('summary');
-            menuSummary.textContent = '...';
-
-            const menuPopover = document.createElement('div');
-            menuPopover.className = 'seg-roi-menu-popover';
+            const actionStrip = document.createElement('div');
+            actionStrip.className = 'seg-roi-inline-actions';
+            actionStrip.hidden = true;
+            actionStrip.addEventListener('click', (e) => e.stopPropagation());
 
             const duplicateBtn = document.createElement('button');
             duplicateBtn.type = 'button';
-            duplicateBtn.className = 'seg-roi-menu-btn';
-            duplicateBtn.textContent = 'Duplicate ROI';
+            duplicateBtn.className = 'seg-roi-inline-btn';
+            duplicateBtn.title = 'Duplicate ROI';
+            duplicateBtn.setAttribute('aria-label', 'Duplicate ROI');
+            duplicateBtn.innerHTML = this.getRoiDuplicateIconSvg();
             duplicateBtn.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                menu.open = false;
                 this.duplicateRoiById(roi.id);
+                setActionsOpen(false);
             });
 
-            const mergeBtn = document.createElement('button');
-            mergeBtn.type = 'button';
-            mergeBtn.className = 'seg-roi-menu-btn';
-            mergeBtn.textContent = 'Merge Into Active';
-            mergeBtn.disabled = !activeId || activeId === roi.id;
-            mergeBtn.addEventListener('click', (e) => {
+            const deleteBtn = document.createElement('button');
+            deleteBtn.type = 'button';
+            deleteBtn.className = 'seg-roi-inline-btn danger';
+            deleteBtn.title = 'Delete ROI';
+            deleteBtn.setAttribute('aria-label', 'Delete ROI');
+            deleteBtn.innerHTML = this.getRoiDeleteIconSvg();
+            deleteBtn.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                menu.open = false;
-                this.mergeRoiIntoActiveById(roi.id);
+                this.deleteRoiById(roi.id);
+                setActionsOpen(false);
             });
 
-            const exportBtn = document.createElement('button');
-            exportBtn.type = 'button';
-            exportBtn.className = 'seg-roi-menu-btn';
-            exportBtn.textContent = 'Export ROI';
-            exportBtn.addEventListener('click', (e) => {
+            actionStrip.append(duplicateBtn, deleteBtn);
+
+            const menuToggle = document.createElement('button');
+            menuToggle.type = 'button';
+            menuToggle.className = 'seg-roi-menu-toggle';
+            menuToggle.textContent = '...';
+            menuToggle.title = 'Row actions';
+            menuToggle.setAttribute('aria-label', 'ROI actions');
+            menuToggle.setAttribute('aria-expanded', 'false');
+            menuToggle.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                menu.open = false;
-                void this.exportRoiById(roi.id);
+                setActionsOpen(actionStrip.hidden);
             });
 
-            menuPopover.append(duplicateBtn, mergeBtn, exportBtn);
-            menu.append(menuSummary, menuPopover);
+            const setActionsOpen = (open: boolean): void => {
+                actionStrip.hidden = !open;
+                visibilityBtn.hidden = open;
+                menuToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+            };
 
-            row.append(colorInput, nameInput, visibilityBtn, lockBtn, busyTag, menu);
+            actionCell.append(visibilityBtn, actionStrip);
+            row.append(colorInput, nameWrap, actionCell, menuToggle);
             this.segRoiList.appendChild(row);
         }
+    }
+
+    private getRoiVisibilityIconSvg(visible: boolean): string {
+        return visible
+            ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z"></path><circle cx="12" cy="12" r="3"></circle></svg>'
+            : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-6 10-6c2.1 0 3.9.6 5.4 1.4"></path><path d="M22 12s-3.5 6-10 6c-2.1 0-3.9-.6-5.4-1.4"></path><path d="M3 3l18 18"></path></svg>';
+    }
+
+    private getRoiDuplicateIconSvg(): string {
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"></rect><rect x="5" y="5" width="10" height="10" rx="2"></rect></svg>';
+    }
+
+    private getRoiDeleteIconSvg(): string {
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"></path><path d="M9 3h6"></path><path d="M8 7v12"></path><path d="M16 7v12"></path><path d="M6 7l1 14h10l1-14"></path></svg>';
+    }
+
+    private deleteRoiById(roiId: string): void {
+        const roi = this.findRoiById(roiId);
+        if (!roi) return;
+        if (!window.confirm(`Delete "${roi.name}"?`)) return;
+
+        this.clearSmartRegionPreview({ render: true, resetStatus: true });
+        this.invalidateActiveRoiStats();
+        const wasActive = this.uiState.state.segmentation.activeROIId === roi.id;
+        let changed = 0;
+        if (this.maskVolume) {
+            changed = this.segmentationStore.remapClass(roi.classId, 0);
+            this.segmentationStore.clearOps();
+        }
+
+        this.roiRegistry.removeById(roi.id);
+        if (wasActive) {
+            const nextActive = this.roiEntries[0] ?? null;
+            if (nextActive) {
+                this.setActiveRoi(nextActive.id);
+            } else {
+                this.setSegmentationState({
+                    activeROIId: null,
+                    activeClassId: 1,
+                });
+                this.updateActiveRoiStatsDisplay(null);
+            }
+        } else {
+            this.refreshSegmentationOverlayUI();
+            this.scheduleActiveRoiStatsRefresh({ force: true });
+        }
+
+        this.scheduleSliceRender();
+        this.updatePixelInfo();
+        this.mark3DPaletteDirty();
+        if (changed > 0) {
+            this.mark3DMaskDirty();
+        }
+        this.schedule3DMaskSync({ immediate: true, render: true });
     }
 
     private duplicateRoiById(sourceRoiId: string): void {
@@ -1761,26 +1883,6 @@ export class ViewerApp {
 
         this.invalidateActiveRoiStats();
         this.setActiveRoi(duplicate.id);
-        this.refreshSegmentationOverlayUI();
-        this.scheduleSliceRender();
-        this.scheduleActiveRoiStatsRefresh({ force: true });
-        this.mark3DPaletteDirty();
-        if (changed > 0) {
-            this.mark3DMaskDirty();
-        }
-        this.schedule3DMaskSync({ immediate: true, render: true });
-    }
-
-    private mergeRoiIntoActiveById(sourceRoiId: string): void {
-        const active = this.getActiveRoi();
-        const source = this.findRoiById(sourceRoiId);
-        if (!active || !source || source.id === active.id || !this.maskVolume) return;
-
-        this.invalidateActiveRoiStats();
-        const changed = this.segmentationStore.remapClass(source.classId, active.classId);
-        this.segmentationStore.clearOps();
-        this.roiRegistry.removeById(source.id);
-
         this.refreshSegmentationOverlayUI();
         this.scheduleSliceRender();
         this.scheduleActiveRoiStatsRefresh({ force: true });
@@ -2928,7 +3030,7 @@ export class ViewerApp {
             && this.isSegmentationMode()
             && seg.enabled
             && seg.tool === 'brush'
-            && (paintValue === 0 || (!!active && !active.locked));
+            && (paintValue === 0 || !!active);
     }
 
     private getEffectiveBrushPaintValue(modifiers?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean }): 0 | 1 {
@@ -2956,7 +3058,7 @@ export class ViewerApp {
         const active = this.getActiveRoi();
         const paintValue = this.getEffectiveBrushPaintValue(modifiers);
         const canErase = paintValue === 0;
-        const canPaint = paintValue === 1 && !!active && !active.locked;
+        const canPaint = paintValue === 1 && !!active;
         return !!this.maskVolume
             && this.isSegmentationMode()
             && seg.enabled
@@ -2971,8 +3073,7 @@ export class ViewerApp {
             && this.isSegmentationMode()
             && seg.enabled
             && seg.tool === 'smart-region'
-            && !!active
-            && !active.locked;
+            && !!active;
     }
 
     private getSmartRegionService(): Sam2SliceService {
@@ -3128,7 +3229,6 @@ export class ViewerApp {
             preview.qualityUsed === 'preview'
             && !!volume
             && !!active
-            && !active.locked
             && preview.volumeKey === this.buildSmartRegionVolumeKey(volume);
         const needsSliceRadiusInference = targetSlices.length > 1;
         const shouldRunApplyInference = canRefine || needsSliceRadiusInference;
@@ -3299,7 +3399,7 @@ export class ViewerApp {
         const active = this.getActiveRoi();
         const eraseMode = seg.paintValue === 0;
         const canApply = isThreshold && !this.segmentationWorkerBusy
-            && (eraseMode || !!(active && !active.locked));
+            && (eraseMode || !!active);
         this.segThresholdApplyBtn.disabled = !canApply;
     }
 
@@ -3308,7 +3408,7 @@ export class ViewerApp {
         const active = this.getActiveRoi();
         const seg = this.uiState.state.segmentation;
         const eraseMode = seg.paintValue === 0;
-        if (!eraseMode && (!active || active.locked)) return;
+        if (!eraseMode && !active) return;
         const classId = eraseMode ? 0 : active!.classId;
 
         this.segmentationWorkerBusy = true;
@@ -3435,7 +3535,7 @@ export class ViewerApp {
         const active = this.getActiveRoi();
         const dragging = this.segmentationDragging;
         const paintValue = this.getEffectiveBrushPaintValue(modifiers);
-        if (paintValue !== 0 && (!active || active.locked)) return 0;
+        if (paintValue !== 0 && !active) return 0;
         const classId = paintValue === 0 ? 0 : active!.classId;
         const mergeKey = this.activePaintStrokeId != null ? `paint-stroke:${this.activePaintStrokeId}` : undefined;
         const op = createPaintStrokeOp({
@@ -3480,7 +3580,7 @@ export class ViewerApp {
         const active = this.getActiveRoi();
         const paintValue = this.getEffectiveBrushPaintValue(modifiers);
         const eraseMode = paintValue === 0;
-        if (!eraseMode && (!active || active.locked)) return;
+        if (!eraseMode && !active) return;
         const classId = eraseMode ? 0 : active!.classId;
         const seg = this.uiState.state.segmentation;
         this.segmentationWorkerBusy = true;
@@ -3545,7 +3645,7 @@ export class ViewerApp {
         const hit = this.getSliceHitFromClient(axis, clientX, clientY);
         if (!hit) return;
         const active = this.getActiveRoi();
-        if (!active || active.locked) return;
+        if (!active) return;
 
         const pointLabel = this.getEffectiveBrushPaintValue(modifiers);
         const volume = this.volume;
@@ -4622,7 +4722,6 @@ export class ViewerApp {
         this.syncModeButtons();
 
         // Segmentation controls
-        const segEnableToggle = document.getElementById('segEnableToggle') as HTMLInputElement | null;
         const segVisibleToggle = document.getElementById('segVisibleToggle') as HTMLInputElement | null;
         const segOpacitySlider = document.getElementById('segOpacitySlider') as HTMLInputElement | null;
         const segOpacityValue = document.getElementById('segOpacityValue');
@@ -4648,7 +4747,6 @@ export class ViewerApp {
         const segPropagateBtn = document.getElementById('segPropagateBtn') as HTMLButtonElement | null;
 
         const seg = this.uiState.state.segmentation;
-        if (segEnableToggle) segEnableToggle.checked = seg.enabled;
         if (segVisibleToggle) segVisibleToggle.checked = seg.visible;
         if (segOpacitySlider) segOpacitySlider.value = seg.overlayOpacity.toFixed(2);
         if (segOpacityValue) segOpacityValue.textContent = seg.overlayOpacity.toFixed(2);
@@ -4668,11 +4766,6 @@ export class ViewerApp {
         this.setSmartRegionStatus(SMART_REGION_STATUS_DEFAULT);
         this.refreshSmartRegionPreviewControls();
 
-        if (segEnableToggle) {
-            segEnableToggle.addEventListener('change', () => {
-                this.setSegmentationState({ enabled: segEnableToggle.checked });
-            });
-        }
         if (segVisibleToggle) {
             segVisibleToggle.addEventListener('change', () => {
                 this.setSegmentationState({ visible: segVisibleToggle.checked });

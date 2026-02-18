@@ -651,21 +651,56 @@ button.active {
     text-align: center;
 }
 
+.seg-primary-btn {
+    width: 100%;
+    height: 32px;
+    border-radius: 8px;
+    border: 1px solid rgba(136, 186, 255, 0.6);
+    background: linear-gradient(180deg, rgba(95, 146, 214, 0.88), rgba(74, 120, 182, 0.92));
+    color: #eff5ff;
+    font-size: 0.73rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+}
+
+.seg-primary-btn:hover {
+    background: linear-gradient(180deg, rgba(112, 161, 226, 0.92), rgba(84, 131, 193, 0.96));
+}
+
 .seg-roi-row {
+    position: relative;
     display: grid;
-    grid-template-columns: 30px minmax(0, 1fr) auto auto 24px 26px;
+    grid-template-columns: 30px minmax(0, 1fr) 28px 26px;
     gap: 6px;
     align-items: center;
-    padding: 6px;
+    padding: 7px 6px 7px 10px;
     border-radius: 8px;
     border: 1px solid rgba(255, 255, 255, 0.08);
     background: rgba(16, 20, 27, 0.66);
-    transition: border-color 0.14s ease, background 0.14s ease;
+    cursor: pointer;
+    transition: border-color 0.14s ease, background 0.14s ease, box-shadow 0.14s ease;
+}
+
+.seg-roi-row::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 6px;
+    bottom: 6px;
+    width: 3px;
+    border-radius: 3px;
+    background: #8eb7f1;
+    opacity: 0;
 }
 
 .seg-roi-row.active {
     border-color: rgba(111, 135, 169, 0.8);
-    background: rgba(111, 135, 169, 0.2);
+    background: rgba(111, 135, 169, 0.18);
+    box-shadow: 0 0 0 1px rgba(111, 135, 169, 0.45);
+}
+
+.seg-roi-row.active::before {
+    opacity: 1;
 }
 
 .seg-roi-color {
@@ -673,66 +708,104 @@ button.active {
     height: 24px;
     border-radius: 6px;
     border: 1px solid var(--sep);
-    background: #ff4d4f;
+    background: none;
     padding: 0;
     cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    overflow: hidden;
+}
+
+.seg-roi-color::-webkit-color-swatch-wrapper {
+    padding: 0;
+    border: 0;
+}
+
+.seg-roi-color::-webkit-color-swatch {
+    border: 0;
+    border-radius: 5px;
+}
+
+.seg-roi-color::-moz-color-swatch {
+    border: 0;
+    border-radius: 5px;
 }
 
 .seg-roi-name {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    padding-right: 4px;
+    color: #e4ebf5;
+    font-size: 0.75rem;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.seg-roi-name-wrap {
+    min-width: 0;
+}
+
+.seg-roi-name-input {
     width: 100%;
     min-width: 0;
     height: 24px;
     padding: 0 6px;
     border-radius: 6px;
-    border: 1px solid var(--sep);
+    border: 1px solid var(--accent);
     background: #1f232a;
     color: #e4ebf5;
     font-size: 0.75rem;
 }
 
-.seg-roi-name:focus {
+.seg-roi-name-input:focus {
     outline: none;
-    border-color: var(--accent);
+    border-color: #a7c8f7;
+    box-shadow: 0 0 0 1px rgba(116, 162, 223, 0.45);
 }
 
-.seg-roi-btn {
-    min-width: 42px;
+.seg-roi-visibility {
+    width: 28px;
     height: 24px;
     border-radius: 6px;
     border: 1px solid var(--sep);
     background: #20252d;
     color: #d6deea;
-    font-size: 0.68rem;
-    padding: 0 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
 }
 
-.seg-roi-btn.off {
-    opacity: 0.56;
+.seg-roi-visibility.off {
+    color: #95a4b8;
+    opacity: 0.72;
 }
 
-.seg-roi-btn.locked {
-    color: #ffcf7c;
+.seg-roi-visibility svg {
+    width: 14px;
+    height: 14px;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
 }
 
-.seg-roi-busy {
-    min-width: 24px;
-    text-align: center;
-    color: #7fa6ff;
-    font-size: 0.68rem;
-    letter-spacing: 0.08em;
-    opacity: 0;
-}
-
-.seg-roi-row.busy .seg-roi-busy {
-    opacity: 1;
+.seg-roi-action-cell {
+    grid-column: 3;
+    justify-self: end;
+    display: inline-flex;
+    align-items: center;
 }
 
 .seg-roi-menu {
     position: relative;
 }
 
-.seg-roi-menu summary {
-    list-style: none;
+.seg-roi-menu-toggle {
+    grid-column: 4;
     width: 24px;
     height: 24px;
     border-radius: 6px;
@@ -742,48 +815,47 @@ button.active {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 0.82rem;
+    font-size: 0.98rem;
     cursor: pointer;
+    line-height: 1;
 }
 
-.seg-roi-menu summary::-webkit-details-marker {
-    display: none;
-}
-
-.seg-roi-menu-popover {
-    position: absolute;
-    top: calc(100% + 6px);
-    right: 0;
-    z-index: 12;
-    display: none;
-    flex-direction: column;
+.seg-roi-inline-actions {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
     gap: 4px;
-    min-width: 156px;
-    padding: 6px;
-    border-radius: 8px;
-    border: 1px solid var(--sep);
-    background: rgba(20, 24, 31, 0.96);
-    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
 }
 
-.seg-roi-menu[open] .seg-roi-menu-popover {
-    display: flex;
+.seg-roi-inline-actions[hidden] {
+    display: none !important;
 }
 
-.seg-roi-menu-btn {
-    width: 100%;
-    min-height: 28px;
+.seg-roi-inline-btn {
+    width: 24px;
+    height: 24px;
+    padding: 0;
     border-radius: 6px;
     border: 1px solid var(--sep);
     background: #20252d;
     color: #d6deea;
-    font-size: 0.7rem;
-    text-align: left;
-    padding: 0 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
 }
 
-.seg-roi-menu-btn:disabled {
-    opacity: 0.45;
+.seg-roi-inline-btn svg {
+    width: 13px;
+    height: 13px;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.seg-roi-inline-btn.danger {
+    color: #ffb3b3;
 }
 
 .seg-action-grid {
@@ -1014,24 +1086,9 @@ button.active {
     gap: 7px;
 }
 
-.seg-active-row {
-    display: grid;
-    grid-template-columns: 14px minmax(0, 1fr) auto;
-    align-items: center;
-    gap: 7px;
-}
-
-.seg-active-color {
-    width: 14px;
-    height: 14px;
-    border-radius: 50%;
-    border: 1px solid rgba(255, 255, 255, 0.3);
-    background: #ff4d4f;
-}
-
 .seg-active-name {
     color: #e6edf7;
-    font-size: 0.78rem;
+    font-size: 0.8rem;
     font-weight: 700;
     white-space: nowrap;
     overflow: hidden;
@@ -1040,12 +1097,12 @@ button.active {
 
 .seg-active-class {
     color: #8fa1ba;
-    font-size: 0.68rem;
+    font-size: 0.67rem;
     letter-spacing: 0.05em;
     text-transform: uppercase;
 }
 
-.seg-active-state {
+.seg-active-empty {
     color: #aeb8c8;
     font-size: 0.72rem;
 }
