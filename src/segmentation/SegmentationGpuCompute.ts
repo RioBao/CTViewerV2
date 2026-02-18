@@ -51,17 +51,32 @@ export class SegmentationGpuCompute {
 
         const shaderModule = this.device.createShaderModule({ code: shaderSource });
 
+        // bfs_step doesn't read indirectArgs (binding 4), so its auto-derived layout
+        // omits that binding. prepare_next does need it. Use an explicit shared layout
+        // covering all 6 bindings so one bind group works for both pipelines.
+        this.bindGroupLayout = this.device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+            ],
+        });
+
+        const pipelineLayout = this.device.createPipelineLayout({
+            bindGroupLayouts: [this.bindGroupLayout],
+        });
+
         this.bfsStepPipeline = this.device.createComputePipeline({
-            layout: 'auto',
+            layout: pipelineLayout,
             compute: { module: shaderModule, entryPoint: 'bfs_step' },
         });
         this.prepareNextPipeline = this.device.createComputePipeline({
-            layout: 'auto',
+            layout: pipelineLayout,
             compute: { module: shaderModule, entryPoint: 'prepare_next' },
         });
-
-        // Both entry points share the same bind group layout.
-        this.bindGroupLayout = this.bfsStepPipeline.getBindGroupLayout(0);
     }
 
     async runRegionGrowSlice(task: RegionGrowGpuTask): Promise<Uint32Array> {
