@@ -42,7 +42,8 @@ export class SegmentationGpuCompute {
     private readonly device: GPUDevice;
     private readonly bfsStepPipeline: GPUComputePipeline;
     private readonly prepareNextPipeline: GPUComputePipeline;
-    private readonly bindGroupLayout: GPUBindGroupLayout;
+    private readonly bfsStepLayout: GPUBindGroupLayout;
+    private readonly prepareNextLayout: GPUBindGroupLayout;
     private readonly maxStorageBufferBindingSize: number;
 
     constructor(gpu: WebGPUContext) {
@@ -51,32 +52,23 @@ export class SegmentationGpuCompute {
 
         const shaderModule = this.device.createShaderModule({ code: shaderSource });
 
-        // bfs_step doesn't read indirectArgs (binding 4), so its auto-derived layout
-        // omits that binding. prepare_next does need it. Use an explicit shared layout
-        // covering all 6 bindings so one bind group works for both pipelines.
-        this.bindGroupLayout = this.device.createBindGroupLayout({
-            entries: [
-                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-                { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-                { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-            ],
-        });
-
-        const pipelineLayout = this.device.createPipelineLayout({
-            bindGroupLayouts: [this.bindGroupLayout],
-        });
-
+        // Use auto layout per pipeline. bfs_step doesn't reference indirectArgs
+        // (binding 4) so its auto layout omits it — indirectBuffer is then only
+        // used as INDIRECT in the bfs_step pass, not as storage. prepare_next
+        // does write indirectArgs, so its auto layout includes binding 4 as
+        // storage; it uses dispatchWorkgroups(1) so no INDIRECT usage there.
+        // This eliminates the "writable storage + INDIRECT in same sync scope" error.
         this.bfsStepPipeline = this.device.createComputePipeline({
-            layout: pipelineLayout,
+            layout: 'auto',
             compute: { module: shaderModule, entryPoint: 'bfs_step' },
         });
         this.prepareNextPipeline = this.device.createComputePipeline({
-            layout: pipelineLayout,
+            layout: 'auto',
             compute: { module: shaderModule, entryPoint: 'prepare_next' },
         });
+
+        this.bfsStepLayout = this.bfsStepPipeline.getBindGroupLayout(0);
+        this.prepareNextLayout = this.prepareNextPipeline.getBindGroupLayout(0);
     }
 
     async runRegionGrowSlice(task: RegionGrowGpuTask): Promise<Uint32Array> {
@@ -179,8 +171,23 @@ export class SegmentationGpuCompute {
             pv.setFloat32(16, seedValue, true);
             this.device.queue.writeBuffer(paramsBuffer, 0, paramsRaw);
 
-            const bindGroup = this.device.createBindGroup({
-                layout: this.bindGroupLayout,
+            // bfs_step bind group: no binding 4 (indirectBuffer not in its auto layout)
+            // → indirectBuffer is only INDIRECT in the bfs_step pass, not storage.
+            const bfsStepBindGroup = this.device.createBindGroup({
+                layout: this.bfsStepLayout,
+                entries: [
+                    { binding: 0, resource: { buffer: valuesBuffer } },
+                    { binding: 1, resource: { buffer: visitedBuffer } },
+                    { binding: 2, resource: { buffer: frontierBuffer } },
+                    { binding: 3, resource: { buffer: stateBuffer } },
+                    { binding: 5, resource: { buffer: paramsBuffer } },
+                ],
+            });
+
+            // prepare_next bind group: includes binding 4 (indirectArgs)
+            // → indirectBuffer is only STORAGE in the prepare_next pass, not INDIRECT.
+            const prepareNextBindGroup = this.device.createBindGroup({
+                layout: this.prepareNextLayout,
                 entries: [
                     { binding: 0, resource: { buffer: valuesBuffer } },
                     { binding: 1, resource: { buffer: visitedBuffer } },
@@ -208,13 +215,13 @@ export class SegmentationGpuCompute {
                 for (let i = 0; i < levelsThisBatch; i++) {
                     const stepPass = encoder.beginComputePass();
                     stepPass.setPipeline(this.bfsStepPipeline);
-                    stepPass.setBindGroup(0, bindGroup);
+                    stepPass.setBindGroup(0, bfsStepBindGroup);
                     stepPass.dispatchWorkgroupsIndirect(indirectBuffer, 0);
                     stepPass.end();
 
                     const prepPass = encoder.beginComputePass();
                     prepPass.setPipeline(this.prepareNextPipeline);
-                    prepPass.setBindGroup(0, bindGroup);
+                    prepPass.setBindGroup(0, prepareNextBindGroup);
                     prepPass.dispatchWorkgroups(1);
                     prepPass.end();
                 }
