@@ -129,21 +129,7 @@ export class SegmentationStore {
 
     remapClass(sourceClassId: number, targetClassId: number): number {
         if (!this._maskVolume) return 0;
-        if (sourceClassId === targetClassId) return 0;
-        if (this._maskVolume.getClassVoxelCount(sourceClassId) === 0) return 0;
-        const [nx, ny, nz] = this._maskVolume.dimensions;
-        let changed = 0;
-        for (let z = 0; z < nz; z++) {
-            for (let y = 0; y < ny; y++) {
-                for (let x = 0; x < nx; x++) {
-                    if (this._maskVolume.getVoxel(x, y, z) !== sourceClassId) continue;
-                    if (this._maskVolume.setVoxel(x, y, z, targetClassId)) {
-                        changed++;
-                    }
-                }
-            }
-        }
-        return changed;
+        return this._maskVolume.remapClass(sourceClassId, targetClassId);
     }
 
     collectClassLinearIndices(classId: number): number[] {

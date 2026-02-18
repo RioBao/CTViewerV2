@@ -19,6 +19,7 @@ export interface MaskVolume {
     getNonZeroVoxelCount(): number;
     getClassVoxelCount(classId: number): number;
     forEachVoxelOfClass(classId: number, visitor: (x: number, y: number, z: number) => void): number;
+    remapClass(sourceClassId: number, targetClassId: number): number;
     clear(): void;
     fill(classId: number): void;
     getSlice(axis: ViewAxis, index: number, target?: MaskTypedArray): MaskSliceData;

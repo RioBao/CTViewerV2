@@ -60,6 +60,7 @@ abstract class BaseMaskVolume implements MaskVolume {
     abstract getVoxel(x: number, y: number, z: number): number;
     abstract setVoxel(x: number, y: number, z: number, classId: number): boolean;
     abstract forEachVoxelOfClass(classId: number, visitor: (x: number, y: number, z: number) => void): number;
+    abstract remapClass(sourceClassId: number, targetClassId: number): number;
     abstract clear(): void;
     abstract fill(classId: number): void;
     abstract getSlice(axis: ViewAxis, index: number, target?: MaskTypedArray): MaskSliceData;
@@ -102,6 +103,13 @@ abstract class BaseMaskVolume implements MaskVolume {
 
     protected finalizeBulkEdit(): void {
         this.markAllDirty();
+    }
+
+    protected applyClassRemap(src: number, tgt: number, count: number): void {
+        this.classCounts[src] -= count;
+        this.classCounts[tgt] += count;
+        if (src === 0) this.nonZeroVoxels += count;
+        else if (tgt === 0) this.nonZeroVoxels -= count;
     }
 
     protected normalizeClassIdOrNull(classId: number): number | null {
@@ -179,6 +187,29 @@ class DenseMaskVolume extends BaseMaskVolume {
             }
         }
         return matched;
+    }
+
+    remapClass(sourceClassId: number, targetClassId: number): number {
+        this.checkDisposed();
+        const src = this.normalizeClassIdOrNull(sourceClassId);
+        const tgt = this.normalizeClassIdOrNull(targetClassId);
+        if (src == null || tgt == null || src === tgt) return 0;
+        if (this.classCounts[src] === 0) return 0;
+
+        // Scan the flat typed array directly — no per-voxel bounds checks or
+        // coordinate arithmetic, so JS engines can optimise this inner loop well.
+        let changed = 0;
+        for (let i = 0; i < this.data.length; i++) {
+            if (this.data[i] === src) {
+                this.data[i] = tgt;
+                changed++;
+            }
+        }
+        if (changed > 0) {
+            this.applyClassRemap(src, tgt, changed);
+            this.finalizeBulkEdit();
+        }
+        return changed;
     }
 
     clear(): void {
@@ -373,6 +404,41 @@ class SparseChunkMaskVolume extends BaseMaskVolume {
         }
 
         return matched;
+    }
+
+    remapClass(sourceClassId: number, targetClassId: number): number {
+        this.checkDisposed();
+        const src = this.normalizeClassIdOrNull(sourceClassId);
+        const tgt = this.normalizeClassIdOrNull(targetClassId);
+        if (src == null || tgt == null || src === tgt) return 0;
+        if (this.classCounts[src] === 0) return 0;
+
+        // For sparse volumes the key advantage: only allocated chunks are scanned.
+        // Unallocated voxels implicitly hold fillValue (always 0 in normal use);
+        // if fillValue happens to equal src, remap it too without touching chunks.
+        let changed = 0;
+
+        if (this.fillValue === src) {
+            // All implicit (unallocated) voxels currently hold src — remap them by
+            // updating fillValue. The count is tracked in classCounts already.
+            this.fillValue = tgt;
+            changed += this.classCounts[src]; // includes implicit voxels
+        }
+
+        for (const chunk of this.chunks.values()) {
+            for (let i = 0; i < chunk.length; i++) {
+                if (chunk[i] === src) {
+                    chunk[i] = tgt;
+                    changed++;
+                }
+            }
+        }
+
+        if (changed > 0) {
+            this.applyClassRemap(src, tgt, changed);
+            this.finalizeBulkEdit();
+        }
+        return changed;
     }
 
     clear(): void {
