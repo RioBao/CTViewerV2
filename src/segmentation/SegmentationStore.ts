@@ -130,6 +130,7 @@ export class SegmentationStore {
     remapClass(sourceClassId: number, targetClassId: number): number {
         if (!this._maskVolume) return 0;
         if (sourceClassId === targetClassId) return 0;
+        if (this._maskVolume.getClassVoxelCount(sourceClassId) === 0) return 0;
         const [nx, ny, nz] = this._maskVolume.dimensions;
         let changed = 0;
         for (let z = 0; z < nz; z++) {
