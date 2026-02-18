@@ -184,17 +184,14 @@ export class SegmentationGpuCompute {
                 ],
             });
 
-            // prepare_next bind group: includes binding 4 (indirectArgs)
+            // prepare_next bind group: only bindings 3 (state) and 4 (indirectArgs),
+            // which are the only ones prepare_next actually references in the shader.
             // → indirectBuffer is only STORAGE in the prepare_next pass, not INDIRECT.
             const prepareNextBindGroup = this.device.createBindGroup({
                 layout: this.prepareNextLayout,
                 entries: [
-                    { binding: 0, resource: { buffer: valuesBuffer } },
-                    { binding: 1, resource: { buffer: visitedBuffer } },
-                    { binding: 2, resource: { buffer: frontierBuffer } },
                     { binding: 3, resource: { buffer: stateBuffer } },
                     { binding: 4, resource: { buffer: indirectBuffer } },
-                    { binding: 5, resource: { buffer: paramsBuffer } },
                 ],
             });
 
