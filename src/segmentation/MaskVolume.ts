@@ -1,5 +1,5 @@
 import type { MaskTypedArray, ViewAxis } from '../types.js';
-import type { CreateMaskOptions, MaskBackend, MaskClassDataType, MaskSliceData, MaskVolume } from './MaskTypes.js';
+import type { CreateMaskOptions, MaskBackend, MaskClassDataType, MaskSliceData, MaskVolume, SliceSelectionResult } from './MaskTypes.js';
 
 const DEFAULT_MAX_DENSE_VOXELS = 128 * 1024 * 1024;
 const DEFAULT_CHUNK_SIZE = 64;
@@ -61,6 +61,8 @@ abstract class BaseMaskVolume implements MaskVolume {
     abstract setVoxel(x: number, y: number, z: number, classId: number): boolean;
     abstract forEachVoxelOfClass(classId: number, visitor: (x: number, y: number, z: number) => void): number;
     abstract remapClass(sourceClassId: number, targetClassId: number): number;
+    abstract writeSliceSelection(axis: ViewAxis, sliceIndex: number, width: number, selectedIndices: Uint32Array, classId: number): SliceSelectionResult;
+    abstract restoreLinearValues(linear: Uint32Array, before: MaskTypedArray): number;
     abstract clear(): void;
     abstract fill(classId: number): void;
     abstract getSlice(axis: ViewAxis, index: number, target?: MaskTypedArray): MaskSliceData;
@@ -209,6 +211,62 @@ class DenseMaskVolume extends BaseMaskVolume {
             this.applyClassRemap(src, tgt, changed);
             this.finalizeBulkEdit();
         }
+        return changed;
+    }
+
+    writeSliceSelection(axis: ViewAxis, sliceIndex: number, width: number, selectedIndices: Uint32Array, classId: number): SliceSelectionResult {
+        this.checkDisposed();
+        const tgt = clampClassId(classId, this.maxClassId);
+        const [nx, ny] = this.dimensions;
+        const nxny = nx * ny;
+
+        // Pre-allocate worst-case undo arrays (compact, typed — no per-voxel objects).
+        const undoLinear = new Uint32Array(selectedIndices.length);
+        const undoBefore = createMaskArray(selectedIndices.length, this.classDataType);
+        let changed = 0;
+
+        for (let i = 0; i < selectedIndices.length; i++) {
+            const s = selectedIndices[i];
+            const sliceX = s % width;
+            const sliceY = (s / width) | 0;
+
+            // Map 2D slice coords to flat 3D linear index — no bounds-check per pixel,
+            // no virtual dispatch, no clampClassId on every iteration.
+            let linear: number;
+            switch (axis) {
+                case 'xy': linear = sliceX       + sliceY * nx + sliceIndex * nxny; break;
+                case 'xz': linear = sliceX       + sliceIndex * nx + sliceY * nxny; break;
+                default:   linear = sliceIndex   + sliceX * nx    + sliceY * nxny; break; // yz
+            }
+            if (linear < 0 || linear >= this.data.length) continue;
+
+            const before = this.data[linear];
+            if (before === tgt) continue;
+
+            this.data[linear] = tgt;
+            this.noteVoxelClassChange(before, tgt);
+            undoLinear[changed] = linear;
+            undoBefore[changed] = before;
+            changed++;
+        }
+
+        if (changed > 0) this.finalizeBulkEdit(); // markAllDirty once, not per voxel
+        return { changed, undoLinear: undoLinear.subarray(0, changed), undoBefore: undoBefore.subarray(0, changed) };
+    }
+
+    restoreLinearValues(linear: Uint32Array, before: MaskTypedArray): number {
+        this.checkDisposed();
+        let changed = 0;
+        for (let i = 0; i < linear.length; i++) {
+            const idx = linear[i];
+            const prev = this.data[idx];
+            const next = before[i];
+            if (prev === next) continue;
+            this.data[idx] = next;
+            this.noteVoxelClassChange(prev, next);
+            changed++;
+        }
+        if (changed > 0) this.finalizeBulkEdit();
         return changed;
     }
 
@@ -438,6 +496,100 @@ class SparseChunkMaskVolume extends BaseMaskVolume {
             this.applyClassRemap(src, tgt, changed);
             this.finalizeBulkEdit();
         }
+        return changed;
+    }
+
+    writeSliceSelection(axis: ViewAxis, sliceIndex: number, width: number, selectedIndices: Uint32Array, classId: number): SliceSelectionResult {
+        this.checkDisposed();
+        const tgt = clampClassId(classId, this.maxClassId);
+        const [nx, ny, nz] = this.dimensions;
+        const cs = this.chunkSize;
+        const nxny = nx * ny;
+
+        const undoLinear = new Uint32Array(selectedIndices.length);
+        const undoBefore = createMaskArray(selectedIndices.length, this.classDataType);
+        let changed = 0;
+
+        for (let i = 0; i < selectedIndices.length; i++) {
+            const s = selectedIndices[i];
+            const sliceX = s % width;
+            const sliceY = (s / width) | 0;
+
+            let x: number, y: number, z: number, linear: number;
+            switch (axis) {
+                case 'xy': x = sliceX; y = sliceY; z = sliceIndex; linear = x + y * nx + z * nxny; break;
+                case 'xz': x = sliceX; y = sliceIndex; z = sliceY; linear = x + y * nx + z * nxny; break;
+                default:   x = sliceIndex; y = sliceX; z = sliceY; linear = x + y * nx + z * nxny; break; // yz
+            }
+            if (x < 0 || x >= nx || y < 0 || y >= ny || z < 0 || z >= nz) continue;
+
+            // Directly access the chunk, allocating it if needed.
+            const cx = Math.floor(x / cs);
+            const cy = Math.floor(y / cs);
+            const cz = Math.floor(z / cs);
+            const key = packChunkKey(cx, cy, cz);
+            let chunk = this.chunks.get(key);
+            const lx = x - cx * cs;
+            const ly = y - cy * cs;
+            const lz = z - cz * cs;
+            const idx = lx + ly * cs + lz * cs * cs;
+            const before = chunk ? chunk[idx] : this.fillValue;
+
+            if (before === tgt) continue;
+
+            if (!chunk) {
+                chunk = createMaskArray(cs * cs * cs, this.classDataType);
+                if (this.fillValue !== 0) chunk.fill(this.fillValue);
+                this.chunks.set(key, chunk);
+            }
+            chunk[idx] = tgt;
+            this.noteVoxelClassChange(before, tgt);
+            undoLinear[changed] = linear;
+            undoBefore[changed] = before;
+            changed++;
+        }
+
+        if (changed > 0) this.finalizeBulkEdit();
+        return { changed, undoLinear: undoLinear.subarray(0, changed), undoBefore: undoBefore.subarray(0, changed) };
+    }
+
+    restoreLinearValues(linear: Uint32Array, before: MaskTypedArray): number {
+        this.checkDisposed();
+        const [nx, , ] = this.dimensions;
+        const nxny = nx * this.dimensions[1];
+        const cs = this.chunkSize;
+        let changed = 0;
+
+        for (let i = 0; i < linear.length; i++) {
+            const lin = linear[i];
+            const x = lin % nx;
+            const y = ((lin / nx) | 0) % this.dimensions[1];
+            const z = (lin / nxny) | 0;
+
+            const cx = Math.floor(x / cs);
+            const cy = Math.floor(y / cs);
+            const cz = Math.floor(z / cs);
+            const key = packChunkKey(cx, cy, cz);
+            let chunk = this.chunks.get(key);
+            const lx = x - cx * cs;
+            const ly = y - cy * cs;
+            const lz = z - cz * cs;
+            const idx = lx + ly * cs + lz * cs * cs;
+            const prev = chunk ? chunk[idx] : this.fillValue;
+            const next = before[i];
+
+            if (prev === next) continue;
+            if (!chunk) {
+                chunk = createMaskArray(cs * cs * cs, this.classDataType);
+                if (this.fillValue !== 0) chunk.fill(this.fillValue);
+                this.chunks.set(key, chunk);
+            }
+            chunk[idx] = next;
+            this.noteVoxelClassChange(prev, next);
+            changed++;
+        }
+
+        if (changed > 0) this.finalizeBulkEdit();
         return changed;
     }
 
