@@ -9,8 +9,10 @@ interface RegionGrowGpuTask {
     tolerance: number;
 }
 
-const WORKGROUP_SIZE = 256;
-const MAX_PERSISTENT_WORKGROUPS = 256;
+// BFS levels processed per GPU command buffer submission.
+// After each batch, the CPU reads back state.nextEnd to detect convergence.
+// 128 levels/batch → at most ~ceil(maxDim/128) mapAsync round-trips.
+const BATCH_SIZE = 128;
 
 function ensurePositiveInt(value: number, name: string): number {
     if (!Number.isFinite(value) || value <= 0) {
@@ -21,39 +23,45 @@ function ensurePositiveInt(value: number, name: string): number {
 
 function destroyBuffers(buffers: GPUBuffer[]): void {
     for (const buffer of buffers) {
-        try {
-            buffer.destroy();
-        } catch {
-            // Ignore device-lost cleanup failures.
-        }
+        try { buffer.destroy(); } catch { /* ignore device-lost cleanup */ }
     }
 }
 
 /**
  * WebGPU compute backend for 2D region-growing.
- * Uses a persistent atomic work queue to avoid per-iteration CPU readbacks.
+ *
+ * Uses iterative BFS via dispatchWorkgroupsIndirect. Each GPU dispatch is
+ * bounded by the frontier size at that BFS level, so no single dispatch can
+ * run long enough to trigger the Windows TDR watchdog (DXGI_ERROR_DEVICE_HUNG).
+ *
+ * The frontier array is monotonically append-only:
+ *   frontier[0..nextEnd-1] = all selected pixels across all BFS levels.
+ * After convergence the whole range is copied to a readback buffer.
  */
 export class SegmentationGpuCompute {
     private readonly device: GPUDevice;
-    private readonly pipeline: GPUComputePipeline;
+    private readonly bfsStepPipeline: GPUComputePipeline;
+    private readonly prepareNextPipeline: GPUComputePipeline;
     private readonly bindGroupLayout: GPUBindGroupLayout;
-    private readonly maxWorkgroupsPerDispatch: number;
     private readonly maxStorageBufferBindingSize: number;
 
     constructor(gpu: WebGPUContext) {
         this.device = gpu.device;
-        this.maxWorkgroupsPerDispatch = this.device.limits.maxComputeWorkgroupsPerDimension;
         this.maxStorageBufferBindingSize = this.device.limits.maxStorageBufferBindingSize;
 
         const shaderModule = this.device.createShaderModule({ code: shaderSource });
-        this.pipeline = this.device.createComputePipeline({
+
+        this.bfsStepPipeline = this.device.createComputePipeline({
             layout: 'auto',
-            compute: {
-                module: shaderModule,
-                entryPoint: 'region_grow_persistent',
-            },
+            compute: { module: shaderModule, entryPoint: 'bfs_step' },
         });
-        this.bindGroupLayout = this.pipeline.getBindGroupLayout(0);
+        this.prepareNextPipeline = this.device.createComputePipeline({
+            layout: 'auto',
+            compute: { module: shaderModule, entryPoint: 'prepare_next' },
+        });
+
+        // Both entry points share the same bind group layout.
+        this.bindGroupLayout = this.bfsStepPipeline.getBindGroupLayout(0);
     }
 
     async runRegionGrowSlice(task: RegionGrowGpuTask): Promise<Uint32Array> {
@@ -73,69 +81,87 @@ export class SegmentationGpuCompute {
 
         const tolerance = Number.isFinite(task.tolerance) ? Math.max(0, task.tolerance) : 0;
         const seedValue = values[task.seedIndex];
-        const seedPasses = Math.abs(values[task.seedIndex] - seedValue) <= tolerance;
-        if (!seedPasses) {
-            return new Uint32Array(0);
-        }
-        const bytes = total * Uint32Array.BYTES_PER_ELEMENT;
-        if (bytes > this.maxStorageBufferBindingSize) {
+
+        const u32Bytes = total * Uint32Array.BYTES_PER_ELEMENT;
+        if (u32Bytes > this.maxStorageBufferBindingSize) {
             throw new Error(
-                `Slice buffer exceeds maxStorageBufferBindingSize (${bytes} > ${this.maxStorageBufferBindingSize})`,
+                `Slice buffer exceeds maxStorageBufferBindingSize (${u32Bytes} > ${this.maxStorageBufferBindingSize})`,
             );
         }
+
+        // --- Buffer allocation ---
 
         const valuesBuffer = this.device.createBuffer({
             size: values.byteLength,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
+        // visited[i] = 1 → pixel has been claimed; prevents re-queuing
         const visitedBuffer = this.device.createBuffer({
-            size: bytes,
+            size: u32Bytes,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
-        const queueBuffer = this.device.createBuffer({
-            size: bytes,
+        // Monotonic frontier list; also the final output
+        const frontierBuffer = this.device.createBuffer({
+            size: u32Bytes,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
+        // BfsState: { levelStart u32 @0, levelEnd u32 @4, nextEnd atomic<u32> @8, _pad u32 @12 }
         const stateBuffer = this.device.createBuffer({
             size: 4 * Uint32Array.BYTES_PER_ELEMENT,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+        });
+        // Indirect dispatch args [x, y, z]; updated each level by prepare_next
+        const indirectBuffer = this.device.createBuffer({
+            size: 3 * Uint32Array.BYTES_PER_ELEMENT,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
         });
         const paramsBuffer = this.device.createBuffer({
             size: 8 * Uint32Array.BYTES_PER_ELEMENT,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
-        const countReadback = this.device.createBuffer({
+        // Readback for state.nextEnd (1 u32, at byte offset 8 in stateBuffer)
+        const nextEndReadback = this.device.createBuffer({
             size: Uint32Array.BYTES_PER_ELEMENT,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         });
 
-        const buffers = [
-            valuesBuffer,
-            visitedBuffer,
-            queueBuffer,
-            stateBuffer,
-            paramsBuffer,
-            countReadback,
+        const buffers: GPUBuffer[] = [
+            valuesBuffer, visitedBuffer, frontierBuffer,
+            stateBuffer, indirectBuffer, paramsBuffer, nextEndReadback,
         ];
 
         try {
+            // --- Initialise buffers ---
+
             this.device.queue.writeBuffer(valuesBuffer, 0, values.buffer, values.byteOffset, values.byteLength);
+
+            // Clear visited, then mark seed as visited
             const initEncoder = this.device.createCommandEncoder();
             initEncoder.clearBuffer(visitedBuffer);
             this.device.queue.submit([initEncoder.finish()]);
+            this.device.queue.writeBuffer(
+                visitedBuffer,
+                task.seedIndex * Uint32Array.BYTES_PER_ELEMENT,
+                new Uint32Array([1]),
+            );
 
-            const seedUint = new Uint32Array([task.seedIndex >>> 0]);
-            const oneUint = new Uint32Array([1]);
-            this.device.queue.writeBuffer(queueBuffer, 0, seedUint);
-            this.device.queue.writeBuffer(visitedBuffer, task.seedIndex * Uint32Array.BYTES_PER_ELEMENT, oneUint);
-            this.device.queue.writeBuffer(stateBuffer, 0, new Uint32Array([0, 1, 0, 0]));
+            // frontier[0] = seedIndex
+            this.device.queue.writeBuffer(frontierBuffer, 0, new Uint32Array([task.seedIndex]));
+
+            // state = { levelStart:0, levelEnd:1, nextEnd:1, _pad:0 }
+            // nextEnd starts at 1 (seed already in frontier slot 0)
+            this.device.queue.writeBuffer(stateBuffer, 0, new Uint32Array([0, 1, 1, 0]));
+
+            // First bfs_step processes 1 seed pixel → 1 workgroup
+            this.device.queue.writeBuffer(indirectBuffer, 0, new Uint32Array([1, 1, 1]));
+
             const paramsRaw = new ArrayBuffer(32);
-            const paramsView = new DataView(paramsRaw);
-            paramsView.setUint32(0, width, true);
-            paramsView.setUint32(4, height, true);
-            paramsView.setUint32(8, total, true);
-            paramsView.setFloat32(12, tolerance, true);
-            paramsView.setFloat32(16, seedValue, true);
+            const pv = new DataView(paramsRaw);
+            pv.setUint32(0, width, true);
+            pv.setUint32(4, height, true);
+            pv.setUint32(8, total, true);
+            pv.setFloat32(12, tolerance, true);
+            pv.setFloat32(16, seedValue, true);
             this.device.queue.writeBuffer(paramsBuffer, 0, paramsRaw);
 
             const bindGroup = this.device.createBindGroup({
@@ -143,65 +169,75 @@ export class SegmentationGpuCompute {
                 entries: [
                     { binding: 0, resource: { buffer: valuesBuffer } },
                     { binding: 1, resource: { buffer: visitedBuffer } },
-                    { binding: 2, resource: { buffer: queueBuffer } },
+                    { binding: 2, resource: { buffer: frontierBuffer } },
                     { binding: 3, resource: { buffer: stateBuffer } },
-                    { binding: 4, resource: { buffer: paramsBuffer } },
+                    { binding: 4, resource: { buffer: indirectBuffer } },
+                    { binding: 5, resource: { buffer: paramsBuffer } },
                 ],
             });
 
-            const suggestedWorkgroups = Math.ceil(total / WORKGROUP_SIZE);
-            const workgroups = Math.max(
-                1,
-                Math.min(this.maxWorkgroupsPerDispatch, MAX_PERSISTENT_WORKGROUPS, suggestedWorkgroups),
-            );
-            if (workgroups > this.maxWorkgroupsPerDispatch) {
-                throw new Error(
-                    `Region grow workgroups exceeded device limit (${workgroups} > ${this.maxWorkgroupsPerDispatch})`,
-                );
+            // --- Iterative BFS ---
+            //
+            // Max BFS depth for an 8-connected grid ≤ max(width, height).
+            // We run BATCH_SIZE levels per command buffer, then read back state.nextEnd.
+            // Convergence: nextEnd didn't grow compared to start of the batch → done.
+
+            const maxDepth = width + height; // conservative upper bound
+            let prevNextEnd = 1; // seed is already in frontier
+            let finalNextEnd = 1;
+
+            for (let levelsRun = 0; levelsRun < maxDepth; levelsRun += BATCH_SIZE) {
+                const levelsThisBatch = Math.min(BATCH_SIZE, maxDepth - levelsRun);
+                const encoder = this.device.createCommandEncoder();
+
+                for (let i = 0; i < levelsThisBatch; i++) {
+                    const stepPass = encoder.beginComputePass();
+                    stepPass.setPipeline(this.bfsStepPipeline);
+                    stepPass.setBindGroup(0, bindGroup);
+                    stepPass.dispatchWorkgroupsIndirect(indirectBuffer, 0);
+                    stepPass.end();
+
+                    const prepPass = encoder.beginComputePass();
+                    prepPass.setPipeline(this.prepareNextPipeline);
+                    prepPass.setBindGroup(0, bindGroup);
+                    prepPass.dispatchWorkgroups(1);
+                    prepPass.end();
+                }
+
+                // Copy state.nextEnd (byte offset 8) to readback buffer
+                encoder.copyBufferToBuffer(stateBuffer, 8, nextEndReadback, 0, Uint32Array.BYTES_PER_ELEMENT);
+                this.device.queue.submit([encoder.finish()]);
+
+                await nextEndReadback.mapAsync(GPUMapMode.READ);
+                finalNextEnd = new Uint32Array(nextEndReadback.getMappedRange())[0] ?? 0;
+                nextEndReadback.unmap();
+
+                // If nextEnd didn't grow since last batch, the frontier is empty
+                if (finalNextEnd === prevNextEnd) break;
+                prevNextEnd = finalNextEnd;
             }
 
-            const encoder = this.device.createCommandEncoder();
-            const pass = encoder.beginComputePass();
-            pass.setPipeline(this.pipeline);
-            pass.setBindGroup(0, bindGroup);
-            pass.dispatchWorkgroups(workgroups);
-            pass.end();
-            encoder.copyBufferToBuffer(
-                stateBuffer,
-                Uint32Array.BYTES_PER_ELEMENT,
-                countReadback,
-                0,
-                Uint32Array.BYTES_PER_ELEMENT,
-            );
-            this.device.queue.submit([encoder.finish()]);
+            if (finalNextEnd <= 0) return new Uint32Array(0);
 
-            await countReadback.mapAsync(GPUMapMode.READ);
-            const selectedCount = new Uint32Array(countReadback.getMappedRange())[0] ?? 0;
-            countReadback.unmap();
-
-            if (selectedCount <= 0) {
-                return new Uint32Array(0);
-            }
+            // --- Read back selected pixels: frontier[0..finalNextEnd-1] ---
 
             const selectedReadback = this.device.createBuffer({
-                size: selectedCount * Uint32Array.BYTES_PER_ELEMENT,
+                size: finalNextEnd * Uint32Array.BYTES_PER_ELEMENT,
                 usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
             });
             try {
-                const selectedEncoder = this.device.createCommandEncoder();
-                selectedEncoder.copyBufferToBuffer(
-                    queueBuffer,
-                    0,
-                    selectedReadback,
-                    0,
-                    selectedCount * Uint32Array.BYTES_PER_ELEMENT,
+                const copyEncoder = this.device.createCommandEncoder();
+                copyEncoder.copyBufferToBuffer(
+                    frontierBuffer, 0,
+                    selectedReadback, 0,
+                    finalNextEnd * Uint32Array.BYTES_PER_ELEMENT,
                 );
-                this.device.queue.submit([selectedEncoder.finish()]);
+                this.device.queue.submit([copyEncoder.finish()]);
 
                 await selectedReadback.mapAsync(GPUMapMode.READ);
-                const selected = new Uint32Array(selectedReadback.getMappedRange()).slice();
+                const result = new Uint32Array(selectedReadback.getMappedRange()).slice();
                 selectedReadback.unmap();
-                return selected;
+                return result;
             } finally {
                 selectedReadback.destroy();
             }
