@@ -2429,7 +2429,7 @@ export class ViewerApp {
         }
     }
 
-    private displayVolume(): void {
+    private displayVolume(options: { preserveNavigation?: boolean } = {}): void {
         const volume = this.volume;
         if (!volume) return;
 
@@ -2437,27 +2437,29 @@ export class ViewerApp {
 
         const [nx, ny, nz] = volume.dimensions;
 
-        // Set window to full data range
-        this.displayWindowMin = volume.min;
-        this.displayWindowMax = volume.max;
-        for (const axis of AXES) {
-            this.sliceRenderers[axis]?.setWindow(volume.min, volume.max);
+        if (!options.preserveNavigation) {
+            // Set window to full data range
+            this.displayWindowMin = volume.min;
+            this.displayWindowMax = volume.max;
+            for (const axis of AXES) {
+                this.sliceRenderers[axis]?.setWindow(volume.min, volume.max);
+            }
+
+            // Navigate to center slices
+            const centerSlices = {
+                xy: Math.floor(nz / 2),
+                xz: Math.floor(ny / 2),
+                yz: Math.floor(nx / 2),
+            };
+            this.uiState.update({ slices: centerSlices });
+
+            // Set crosshair to center
+            this.crosshairPos = {
+                x: Math.floor(nx / 2),
+                y: Math.floor(ny / 2),
+                z: Math.floor(nz / 2),
+            };
         }
-
-        // Navigate to center slices
-        const centerSlices = {
-            xy: Math.floor(nz / 2),
-            xz: Math.floor(ny / 2),
-            yz: Math.floor(nx / 2),
-        };
-        this.uiState.update({ slices: centerSlices });
-
-        // Set crosshair to center
-        this.crosshairPos = {
-            x: Math.floor(nx / 2),
-            y: Math.floor(ny / 2),
-            z: Math.floor(nz / 2),
-        };
 
         // Upload volume to 3D renderer
         // Streaming volumes: upload the 4x downsampled MIP volume ("low")
@@ -2522,7 +2524,9 @@ export class ViewerApp {
                     uploadOrDisable(mipVolume, 'low');
                 }
             }
-            this.mipRenderer.resetCamera();
+            if (!options.preserveNavigation) {
+                this.mipRenderer.resetCamera();
+            }
         }
 
         // Compute histogram (from MIP volume, which is always in-memory)
@@ -2924,7 +2928,7 @@ export class ViewerApp {
                             ? { regionGrowTolerance: this.computeAutoRegionGrowTolerance(fullVolume.min, fullVolume.max) }
                             : {}),
                     });
-                    this.displayVolume();
+                    this.displayVolume({ preserveNavigation: true });
                     this.hideLoadingOverlay();
                 },
             );
